@@ -1,4 +1,4 @@
-# CAN bus logging pipeline (goatrnet)
+# CAN bus logging pipeline (for goatrnet devices)
 
 Continuously captures `candump` output from `can0`, writes it in time-bucketed
 segments, compresses each segment with **zstd**, and uploads finished segments
@@ -29,7 +29,7 @@ never ambiguous:
 | reason | meaning                                                              |
 |--------|----------------------------------------------------------------------|
 | `idle` | bus went silent — the session ended here                             |
-| `cont` | hit the `CAN_WINDOW` size cap — the *same* session continues next seg |
+| `cont` | hit the `CAN_WINDOW` size cap — the *same* session continues next segment |
 | `stop` | the logger was stopped (service restart/shutdown) mid-session        |
 
 So a time gap *after* an `idle` or `stop` segment is an expected session
@@ -42,7 +42,7 @@ genuinely missing file.
 |------------------------|-------------------------------------------------------------|
 | `canlog-rotate`     | Reads `candump -L`, writes/rotates/compresses segments      |
 | `canlogger.service`    | Runs the capture pipeline under systemd                     |
-| `canlog-upload`     | Drains the spool to the cloud via rclone (verified delete)  |
+| `canlog-upload`     | Drains the spool to the cloud via rclone (verified delete/garbage collection of old files) |
 | `canlog-upload.service`| Oneshot unit that runs the uploader                         |
 | `canlog-upload.timer`  | Triggers the uploader every 10 minutes                      |
 
@@ -66,7 +66,8 @@ same bucket. The timestamp is when the segment *opened* (UTC).
 ### 1. Install the package
 
 Easiest path: build the `.deb` (see *Building the Debian package* at the end of
-this README) and install it on the Pi:
+this README; you'll need a Linux machine to build, so ask a maintainer if you
+don't have access to one) and install it on the Pi:
 
 ```bash
 sudo apt install ./canlogger_0.1.0_all.deb     # apt resolves runtime deps
@@ -84,12 +85,6 @@ What that gets you:
 The runtime dependencies (`can-utils`, `zstd`, `python3`, `rclone`, `bash`) are
 declared in the package and pulled in by apt automatically.
 
-> **Manual install fallback** — if you'd rather not build the package, copy
-> `canlog-rotate` and `canlog-upload` to `/usr/bin/` (chmod +x),
-> copy the three unit files to `/etc/systemd/system/`, `daemon-reload`, then
-> `systemctl enable --now canlogger.service`. The package automates exactly
-> this; behavior is identical.
-
 ### 2. Configure rclone (required before enabling the uploader)
 
 ```bash
@@ -100,29 +95,15 @@ In `rclone config`, create a remote **named `canremote`** (the scripts default
 to this name; change `CANLOG_REMOTE` in `canlog-upload.service` if you pick
 another).
 
-**Google Drive** — note it's a *headless* Pi, so when `rclone config` asks
-"Use auto config?" answer **No**. It prints a command; run that command on your
-**Mac** (which has a browser), complete the Google login, and paste the
-resulting token back into the Pi. This is the `rclone authorize` flow — fiddly
-once, then permanent. Consider creating a dedicated folder (e.g. `can-logs`) so
-the remote path is `canremote:can-logs`.
-
-> **Use `drive.file` scope.** When `rclone config` asks for the Drive `scope`,
-> choose `drive.file` rather than full `drive`. This scope limits the token to
-> files **rclone itself created** — so a compromised Pi or stolen token cannot
-> read or overwrite anything else in the Drive. It could still write *new*
-> files elsewhere, but it cannot see or damage pre-existing data. It's a
-> capability boundary, not an identity one: revoking it means revoking the
-> rclone app for the whole account (acceptable at our scale of 2–3 Pis). One
-> consequence — because the token only sees rclone-created files, a `can-logs`
-> folder you make by hand in the Drive web UI is invisible to rclone; let
-> rclone create its own folder instead.
-
 **Backblaze B2 (no OAuth, easier headless)** — if you'd rather skip the token
 dance: create a bucket and an application key in the B2 web console, choose
 `b2` as the remote type, and paste the key ID + key. Done.
 
-Either way, test before relying on it — and test **as root**, since that is who
+**Other rclone backends**
+You can use AWS S3, Google Drive, etc etc. `rclone` supports many
+backends/remotes, we're just not documenting any here.
+
+Test before relying on it — and test **as root**, since that is who
 the timer runs as:
 
 ```bash
@@ -255,7 +236,7 @@ indicates **the Pi** went down, not the chair.
 > from the R-net 24 V bus, this distinction must be re-verified — measure
 > whether the 24 V rail (and thus the Pi) stays energised when the chair is
 > switched off. Only if it does will `idle` (chair off) and `cont`-no-successor
-> (power lost) remain distinguishable.
+> (power lost) remain distinguishable. We expect this to be true - but verify.
 
 ## Decompress and concatenate into one log
 
@@ -277,7 +258,7 @@ there is no shared dictionary or cross-segment state to reconstruct.
 ## Pipe straight into a reader (no intermediate file)
 
 ```bash
-# Wireshark/tshark read the candump text log directly — no conversion needed.
+# Wireshark/tshark can read the candump text log directly — no conversion needed.
 # Decompress to a file and open it:
 zstdcat session-goatrnet2-*.log.zst > merged.log      # then File > Open in Wireshark
 # or pipe straight in:
@@ -340,8 +321,8 @@ sudo apt install build-essential debhelper dpkg-dev pandoc
 ```
 
 You need a Debian/Ubuntu-style Linux for this — the Debian build tools
-(`dpkg-buildpackage`, `debhelper`, `lintian`) don't exist on macOS and aren't
-straightforward to install there. In order of least friction:
+(`dpkg-buildpackage`, `debhelper`, `lintian`) don't exist on macOS or Windows,
+and aren't straightforward to install there. In order of least friction:
 
 - **Build on the Pi itself.** Zero setup: the Pi already runs Raspberry Pi OS.
   `apt install` the tooling above and build in place. dpkg-buildpackage on a
@@ -411,4 +392,3 @@ To clean build artifacts:
 ```bash
 dh clean    # or: rm -rf debian/canlogger debian/.debhelper debian/*.log debian/*.substvars
 ```
-
