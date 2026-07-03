@@ -69,7 +69,7 @@ Easiest path: build the `.deb` (see *Building the Debian package* at the end of
 this README) and install it on the Pi:
 
 ```bash
-sudo apt install ./canlogger_0.1.0-1_all.deb     # apt resolves runtime deps
+sudo apt install ./canlogger_0.1.0_all.deb     # apt resolves runtime deps
 ```
 
 What that gets you:
@@ -371,9 +371,9 @@ Flags:
 Output lands in the **parent directory** (Debian convention):
 
 ```
-../canlogger_0.1.0-1_all.deb
-../canlogger_0.1.0-1_amd64.buildinfo
-../canlogger_0.1.0-1_amd64.changes
+../canlogger_0.1.0_all.deb
+../canlogger_0.1.0_amd64.buildinfo
+../canlogger_0.1.0_amd64.changes
 ```
 
 The `.deb` is what you ship; the others are build metadata.
@@ -383,16 +383,16 @@ The `.deb` is what you ship; the others are build metadata.
 If you built on a separate machine, copy the `.deb` over first:
 
 ```bash
-scp ../canlogger_0.1.5-1_all.deb pi@goatrnet.local:/tmp/
+scp ../canlogger_0.1.5_all.deb pi@goatrnet.local:/tmp/
 ssh pi@goatrnet.local
-sudo apt install /tmp/canlogger_0.1.5-1_all.deb
+sudo apt install /tmp/canlogger_0.1.5_all.deb
 ```
 
 If you built on the Pi itself, the `.deb` is already there — just install
 it directly:
 
 ```bash
-sudo apt install ../canlogger_0.1.5-1_all.deb
+sudo apt install ../canlogger_0.1.5_all.deb
 ```
 
 Using `apt install` (not `dpkg -i`) means apt will resolve and fetch any
@@ -412,11 +412,3 @@ To clean build artifacts:
 dh clean    # or: rm -rf debian/canlogger debian/.debhelper debian/*.log debian/*.substvars
 ```
 
-## Known policy violations (lintian-not-clean)
-
-This package is deliberately not fully lintian-clean. The remaining issues:
-
-- **No upstream changelog** distinct from the Debian changelog.
-
-None of these affect the package working correctly; they would matter only if
-this were ever to go into a real Debian repository.
