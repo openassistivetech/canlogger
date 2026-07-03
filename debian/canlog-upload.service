@@ -1,0 +1,23 @@
+[Unit]
+Description=Upload finished CAN .zst segments to cloud remote
+# Network must be up to upload. If it isn't, the run just finds nothing it can
+# send and the timer retries later — no data is lost, segments stay spooled.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Adjust the path if you keep the script somewhere other than /home/pi.
+ExecStart=/usr/bin/canlog-upload
+Environment=CANLOG_SPOOL=/var/spool/canlog
+# Set this to your configured rclone remote (see README). Format: remote:path
+Environment=CANLOG_REMOTE=canremote:goat-rnet-logs
+Environment=CANLOG_MIN_FREE_MB=2048
+# Keep local copies at least this long before pruning (any rclone duration:
+# 3d, 12h, 2w, etc.). Local files never uploaded successfully are preserved
+# regardless — the pruner only deletes files it can verify on the remote.
+Environment=CANLOG_LOCAL_RETAIN=14d
+# rclone keeps its config/token here; root runs the timer, so point at root's.
+# If you ran `rclone config` as the pi user, change this to /home/pi/.config/rclone
+# or run the timer as User=pi instead.
+Environment=RCLONE_CONFIG=/root/.config/rclone/rclone.conf

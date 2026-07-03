@@ -1,0 +1,14 @@
+[Unit]
+Description=Periodically upload CAN .zst segments to cloud remote
+
+[Timer]
+# First run 2 min after boot, then every 10 min. Each run drains whatever
+# finished segments have accumulated. With a 5-min CAN_WINDOW this means at
+# most ~2-3 segments per upload run — small, frequent, low-risk batches.
+OnBootSec=2min
+OnUnitActiveSec=10min
+# If the Pi was off when a run was due, do it on next boot instead of skipping.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

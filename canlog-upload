@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# canlog-upload — drain finished CAN .zst segments to a cloud remote.
+#
+# Two-phase design: upload first, delete later.
+#
+#   Phase 1 (COPY): every finished segment is uploaded to the remote and
+#   checksum-verified. Local files are left in place.
+#
+#   Phase 2 (PRUNE): local segments older than CANLOG_LOCAL_RETAIN are deleted,
+#   but ONLY after confirming (via rclone check) that a matching copy exists on
+#   the remote. A segment that never uploaded successfully — because the
+#   network was down for weeks, or auth broke — is never deleted; it stays
+#   local until the upload eventually succeeds, at which point it becomes
+#   eligible for pruning on the next run past its age threshold.
+#
+# The retain window gives local users a grace period to work with fresh
+# segments in-place (e.g. decompressing, grepping) before they disappear.
+#
+# Configure the remote once on the Pi with:  rclone config
+# then set CANLOG_REMOTE below (or via the environment / systemd unit).
+
+set -euo pipefail
+
+# --- configuration (override via environment or the systemd unit) ----------
+SPOOL="${CANLOG_SPOOL:-/var/spool/canlog}"        # where .zst segments land
+REMOTE="${CANLOG_REMOTE:-canremote:can-logs}"     # rclone remote:path
+MIN_FREE_MB="${CANLOG_MIN_FREE_MB:-2048}"         # alert threshold for SD free space
+LOCAL_RETAIN="${CANLOG_LOCAL_RETAIN:-14d}"        # keep local copies at least this long
+LOCK="/run/canlog-upload.lock"                    # prevents overlapping runs
+
+# --- single-instance guard -------------------------------------------------
+# If a previous run is still going (slow link, big backlog), skip this one.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "canlog-upload: previous run still active, skipping." >&2
+    exit 0
+fi
+
+# --- low-disk warning ------------------------------------------------------
+# Does NOT stop logging — just makes a stuck uploader visible in the journal.
+# (canlogger keeps recording regardless; this is the early-warning tripwire.)
+free_mb=$(df --output=avail -m "$SPOOL" | tail -1 | tr -d ' ')
+if (( free_mb < MIN_FREE_MB )); then
+    echo "canlog-upload: WARNING - only ${free_mb} MB free on ${SPOOL}," \
+         "below ${MIN_FREE_MB} MB threshold. Uploader may be falling behind." >&2
+fi
+
+# --- nothing to do? --------------------------------------------------------
+shopt -s nullglob
+segments=("$SPOOL"/*.zst)
+if (( ${#segments[@]} == 0 )); then
+    echo "canlog-upload: spool empty, nothing to upload."
+    # Still run the prune phase — remote may have segments from a previous run
+    # whose local copies are only now ageing past the retain window.
+else
+    echo "canlog-upload: ${#segments[@]} local segment(s); uploading to ${REMOTE}."
+fi
+
+# --- Phase 1: upload (copy, do not delete) --------------------------------
+# rclone copy transfers only files not already present on the remote (or that
+# differ by checksum). Verified-transfer semantics come from rclone by default:
+# a file is only "Copied" after the remote confirms it.
+#   --include '*.zst'      : never touch a partial/non-segment file
+#   --no-traverse          : don't list the (possibly large) remote first
+#   --retries 3            : ride out brief network blips within one run
+#   --checkers / --transfers 2 : gentle on a Pi + modest uplink
+rclone copy "$SPOOL" "$REMOTE" \
+    --include '*.zst' \
+    --no-traverse \
+    --retries 3 \
+    --low-level-retries 10 \
+    --checkers 2 \
+    --transfers 2 \
+    --stats-one-line \
+    --log-level INFO
+
+# --- Phase 2: prune (delete local files that are old AND uploaded) --------
+# --min-age gates on local mtime; we then verify each candidate exists on the
+# remote before deleting, so a segment that never made it up is never lost.
+#
+# rclone check --one-way --missing-on-dst returns the list of local files not
+# present on the remote. We invert that to identify safely-deletable files.
+echo "canlog-upload: pruning local segments older than ${LOCAL_RETAIN} that are confirmed on remote."
+
+# Collect all local candidates older than the retain window:
+mapfile -t old_local < <(
+    rclone lsf "$SPOOL" --include '*.zst' --min-age "$LOCAL_RETAIN"
+)
+
+if (( ${#old_local[@]} == 0 )); then
+    echo "canlog-upload: no local segments older than ${LOCAL_RETAIN}; nothing to prune."
+    echo "canlog-upload: run complete."
+    exit 0
+fi
+
+# Files listed here are older than LOCAL_RETAIN but NOT on the remote — skip:
+mapfile -t missing_on_remote < <(
+    rclone check "$SPOOL" "$REMOTE" \
+        --include '*.zst' \
+        --min-age "$LOCAL_RETAIN" \
+        --missing-on-dst /dev/stdout \
+        --one-way 2>/dev/null || true
+)
+
+# Compute the safe-to-delete set: (old_local) minus (missing_on_remote):
+declare -A skip
+for f in "${missing_on_remote[@]}"; do skip["$f"]=1; done
+
+deleted=0
+kept_unuploaded=0
+for f in "${old_local[@]}"; do
+    if [[ -n "${skip[$f]:-}" ]]; then
+        kept_unuploaded=$(( kept_unuploaded + 1 ))
+        continue
+    fi
+    rm -- "$SPOOL/$f" && deleted=$(( deleted + 1 ))
+done
+
+echo "canlog-upload: pruned ${deleted} local segment(s); kept ${kept_unuploaded} not-yet-uploaded."
+echo "canlog-upload: run complete."

@@ -1,0 +1,30 @@
+#!/usr/bin/make -f
+# Single-line "let debhelper do everything sensible" recipe.
+%:
+	dh $@
+
+# Per-unit systemd enable control:
+#   - canlogger.service: enable AND start on install (the capture pipeline)
+#   - canlog-upload.service + canlog-upload.timer: install only; admin enables
+#     manually once rclone has been configured with a remote.
+override_dh_installsystemd:
+	dh_installsystemd --name=canlogger
+	dh_installsystemd --name=canlog-upload --no-enable --no-start
+
+# Generate the man page from markdown at build time. Keeping the source in
+# markdown means the doc is editable the same way as the README; pandoc emits
+# roff that man(1) reads. debhelper's dh_installman auto-installs *.7 from the
+# build tree into /usr/share/man/man7/.
+override_dh_auto_build:
+	pandoc --standalone --to man canlogger.7.md -o canlogger.7
+	dh_auto_build
+
+override_dh_auto_clean:
+	rm -f canlogger.7
+	dh_auto_clean
+
+# Leave /usr/share/doc/canlogger/README.md uncompressed. It's small (~18 KB)
+# and users read it directly; gzipping just forces zless/zcat every time.
+# Man pages under /usr/share/man/ are still compressed by dh_compress normally.
+override_dh_compress:
+	dh_compress -X README.md

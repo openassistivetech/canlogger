@@ -1,0 +1,23 @@
+Source: canlogger
+Section: misc
+Priority: optional
+Maintainer: goatrnet <ian@openassistivetech.org>
+Build-Depends: debhelper-compat (= 13), pandoc
+Standards-Version: 4.6.0
+
+Package: canlogger
+Architecture: all
+Depends: ${misc:Depends},
+         can-utils,
+         zstd,
+         python3,
+         rclone,
+         bash (>= 4)
+Description: CAN bus logger with session detection and cloud upload
+ Captures candump output from can0 into time-bucketed, zstd-compressed segments
+ with session detection (silence ends a session, traffic starts a new one) and
+ ships finished segments to a configurable rclone remote.
+ .
+ The canlogger service is enabled automatically on install. The canlog-upload
+ timer is installed but NOT enabled, because rclone needs configuring with the
+ cloud destination first. See /usr/share/doc/canlogger/README.md for setup.

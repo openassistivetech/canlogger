@@ -1,0 +1,71 @@
+canlogger (0.1.6-1) UNRELEASED; urgency=medium
+
+  * README: correct the "building the package" section. Previous text implied
+    macOS could build Debian packages natively, which it cannot. New text
+    lists the three real options (build on Pi, build in Docker on Mac, build
+    on any Debian/Ubuntu box) in order of least friction. Also updates the
+    install example filenames to current version, and includes pandoc in the
+    apt-install line for build dependencies.
+
+ -- goatrnet <ian@openassistivetech.org>  Fri, 03 Jul 2026 23:20:00 +0000
+
+canlogger (0.1.5-1) UNRELEASED; urgency=medium
+
+  * Ship /usr/share/doc/canlogger/README.md uncompressed. It's small enough
+    that gzipping just makes reading it slightly more annoying (zless/zcat
+    every time). Man page updated to reference the uncompressed path.
+
+ -- goatrnet <ian@openassistivetech.org>  Fri, 03 Jul 2026 23:00:00 +0000
+
+canlogger (0.1.4-1) UNRELEASED; urgency=medium
+
+  * Uploader: replace single-phase rclone move with two-phase copy + age-gated
+    delete. Local segments now persist at least CANLOG_LOCAL_RETAIN (default
+    14 days) after upload, giving users a grace period to work with fresh
+    files in place. Local files that never uploaded successfully are never
+    deleted regardless of age -- prune-safety is verified per-file via
+    rclone check before any deletion.
+  * Add canlogger(7) man page pointing at /usr/share/doc/canlogger/ for the
+    full documentation. Sourced from markdown, generated with pandoc at
+    build time; adds pandoc to Build-Depends.
+  * README: document the manual-trigger command
+    (systemctl start canlog-upload.service).
+
+ -- goatrnet <ian@openassistivetech.org>  Fri, 03 Jul 2026 22:45:00 +0000
+
+canlogger (0.1.3-1) UNRELEASED; urgency=medium
+
+  * Default CANLOG_REMOTE to canremote:goat-rnet-logs (matches the actual B2
+    bucket name used in deployment).
+
+ -- goatrnet <ian@openassistivetech.org>  Fri, 03 Jul 2026 18:30:00 +0000
+
+canlogger (0.1.2-1) UNRELEASED; urgency=medium
+
+  * Rename installed binaries to drop language-revealing extensions:
+    canlog-rotate.py -> canlog-rotate, canlog-upload.sh -> canlog-upload.
+    Per Debian policy, scripts in /usr/bin should not expose their
+    implementation language in the filename.
+  * Set a real maintainer email.
+
+ -- goatrnet <ian@openassistivetech.org>  Thu, 18 Jun 2026 19:00:00 +0000
+
+canlogger (0.1.1-1) UNRELEASED; urgency=medium
+
+  * Install scripts into /usr/bin instead of /usr/local/bin, complying with
+    Debian policy (/usr/local is reserved for the local administrator).
+    Removes the dh_usrlocal override from debian/rules.
+
+ -- goatrnet <ian@openassistivetech.org>  Thu, 18 Jun 2026 18:40:00 +0000
+
+canlogger (0.1.0-1) UNRELEASED; urgency=medium
+
+  * Initial packaging of the goatrnet CAN logger pipeline.
+  * Includes canlog-rotate.py (capture + session-aware rotation),
+    canlog-upload.sh (rclone-based spool drainer), and their systemd
+    service/timer units.
+  * canlogger.service is enabled automatically on install.
+  * canlog-upload.timer is installed but NOT enabled, because rclone needs
+    configuring with a remote first. See README.
+
+ -- goatrnet <ian@openassistivetech.org>  Thu, 18 Jun 2026 12:00:00 +0000

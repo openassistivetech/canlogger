@@ -1,0 +1,34 @@
+[Unit]
+Description=CAN bus logger (candump -> rotating zstd segments)
+# can0 is brought up by some other mechanism (systemd-networkd, ifupdown, etc.)
+# This unit only gates on the netdev existing -- not on it being configured at
+# any particular bitrate, since that is a per-deployment concern.
+Requires=sys-subsystem-net-devices-can0.device
+After=sys-subsystem-net-devices-can0.device
+# NOTE: no time-sync gate. With no RTC and a possibly-offline boot, the clock
+# may be wrong until NTP syncs, then jump forward. Logging starts immediately
+# regardless; the parser must treat non-monotonic inter-frame deltas as clock
+# steps. Add Wants/After=time-sync.target + enable systemd-time-wait-sync.service
+# if an RTC is fitted.
+
+[Service]
+Type=simple
+# pipefail so a dead rotator (or candump) propagates failure to systemd, which
+# then restarts the whole pipeline rather than leaving a zombie half-pipe.
+ExecStart=/bin/bash -c 'set -o pipefail; candump -L can0 | /usr/bin/canlog-rotate'
+Restart=always
+RestartSec=2
+# Worst-case clean stop: rotator wakes every 1s, finishes flushing/compressing
+# its active segment, then exits. 30s is comfortable headroom.
+TimeoutStopSec=30
+
+# /run/canlog (tmpfs) auto-created and cleaned up by systemd:
+RuntimeDirectory=canlog
+Environment=CAN_STAGE=/run/canlog
+Environment=CAN_SPOOL=/var/spool/canlog
+Environment=CAN_WINDOW=300
+Environment=CAN_IDLE=10
+Environment=CAN_ZSTD_LEVEL=19
+
+[Install]
+WantedBy=multi-user.target

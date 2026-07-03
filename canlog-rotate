@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Rotating candump logger with session detection.
+
+Reads `candump -L` output on stdin, writes time-bucketed segment files, and
+compresses each closed segment with zstd into a spool directory for a separate
+uploader process to pick up.
+
+Lossless: every frame, including heartbeats, is written verbatim. Redundancy
+(repeated heartbeat payloads, etc.) is collapsed by zstd, not by dropping data.
+
+Session model
+-------------
+The CAN bus is silent while the wheelchair is powered off. candump is kept
+running continuously (so power-on handshakes are always captured), but the
+rotator does NOT create empty segments during silence:
+
+  * A segment is opened lazily -- when the first frame of activity arrives.
+  * If the bus is silent for CAN_IDLE seconds, the current segment is closed
+    with reason "idle". That marks the end of a session; no new segment is
+    opened until traffic resumes.
+  * A session running longer than CAN_WINDOW seconds is split: the segment is
+    closed with reason "cont" and the next frame opens a fresh one. The session
+    continues -- the split is purely a size cap.
+  * On shutdown (SIGTERM/SIGINT) an open segment is closed with reason "stop".
+
+The close reason is encoded in the published filename, so a time gap between
+segments can be told apart from a lost file:
+
+    session-<host>-<UTC timestamp>-<reason>.log.zst     reason: idle | cont | stop
+
+A gap after an "idle" or "stop" segment is an expected session boundary (the
+chair was off). Consecutive "cont" segments belong to one long session and can
+simply be concatenated. See the README for reassembly details.
+
+Usage:
+    candump -L can0 | canlog-rotate
+
+Run it under systemd so it restarts on crash. Point the uploader at CAN_SPOOL.
+
+Environment knobs:
+    CAN_WINDOW       max seconds per segment        (default 300)
+    CAN_IDLE         silence that ends a session    (default 10)
+    CAN_STAGE        dir for the hot/active file    (default /run/canlog -> tmpfs)
+    CAN_SPOOL        dir for finished .zst segments (default /var/spool/canlog)
+    CAN_ZSTD_LEVEL   zstd level 1-19                (default 19)
+    CANLOG_HOST      name embedded in the filename  (default: system hostname)
+
+Segment filenames are self-identifying, so a file stays meaningful after it
+leaves this Pi and segments from multiple Pis can never collide in a bucket.
+"""
+import os
+import re
+import sys
+import time
+import select
+import signal
+import socket
+import subprocess
+
+WINDOW = int(os.environ.get("CAN_WINDOW", "300"))
+IDLE   = int(os.environ.get("CAN_IDLE", "10"))
+STAGE  = os.environ.get("CAN_STAGE", "/run/canlog")
+SPOOL  = os.environ.get("CAN_SPOOL", "/var/spool/canlog")
+ZLEVEL = os.environ.get("CAN_ZSTD_LEVEL", "19")
+
+# How often the read loop wakes to check the idle / window deadlines while the
+# bus is quiet. 1 s makes idle/window detection accurate to ~1 s, plenty given
+# CAN_IDLE / CAN_WINDOW are tens-to-hundreds of seconds. Not a tunable knob.
+POLL_INTERVAL = 1.0
+
+# Host tag for segment filenames. Sanitised so an odd hostname can't inject a
+# path separator or whitespace; falls back to "unknown" if it sanitises empty.
+_raw_host = os.environ.get("CANLOG_HOST") or socket.gethostname()
+HOST = re.sub(r"[^A-Za-z0-9._-]", "-", _raw_host).strip("-") or "unknown"
+
+os.makedirs(STAGE, exist_ok=True)
+os.makedirs(SPOOL, exist_ok=True)
+
+_seg_path = None        # path of the active staging file, or None when idle
+_seg_fh = None
+_seg_start = 0.0        # wall-clock time the active segment was opened
+_last_frame = 0.0       # wall-clock time the most recent frame was written
+_stop = False           # set by the signal handler to request a clean exit
+
+
+def open_segment():
+    """Open a new staging segment. Called lazily -- on the first frame of a
+    session, or the first frame after a window-cap rotation."""
+    global _seg_path, _seg_fh, _seg_start
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    _seg_path = os.path.join(STAGE, f"session-{HOST}-{ts}.log")
+    _seg_fh = open(_seg_path, "w", buffering=1)  # line-buffered
+    _seg_start = time.time()
+
+
+def close_segment(reason):
+    """Close the active segment, compress it, and publish atomically to SPOOL.
+    `reason` (idle|cont|stop) is encoded into the published filename. No-op if
+    no segment is currently open."""
+    global _seg_path, _seg_fh
+    if _seg_fh is None:
+        return
+    _seg_fh.close()
+    _seg_fh = None
+    if os.path.getsize(_seg_path) == 0:          # defensive: lazy-open means a
+        os.remove(_seg_path)                     # segment always has >=1 frame
+        _seg_path = None
+        return
+    stem = os.path.basename(_seg_path)[:-4]      # drop trailing ".log"
+    name = f"{stem}-{reason}.log.zst"
+    tmp = os.path.join(SPOOL, name + ".tmp")
+    final = os.path.join(SPOOL, name)
+    subprocess.run(["zstd", "-q", "-" + ZLEVEL, _seg_path, "-o", tmp], check=True)
+    os.replace(tmp, final)                       # atomic: uploader sees it whole
+    os.remove(_seg_path)
+    _seg_path = None
+
+
+def request_stop(*_):
+    """Signal handler: ask the main loop to exit. Kept minimal -- the actual
+    close happens in the loop's finally block, so there is no re-entrant close
+    if a signal lands mid-rotation."""
+    global _stop
+    _stop = True
+
+
+signal.signal(signal.SIGINT, request_stop)
+signal.signal(signal.SIGTERM, request_stop)
+
+_stdin_fd = sys.stdin.fileno()
+_buf = b""
+
+try:
+    while not _stop:
+        # Wake on incoming data OR after POLL_INTERVAL, so idle/window
+        # deadlines are noticed even while the bus is completely silent.
+        ready, _, _ = select.select([_stdin_fd], [], [], POLL_INTERVAL)
+        now = time.time()
+
+        if ready:
+            chunk = os.read(_stdin_fd, 65536)
+            if not chunk:                        # EOF: candump exited
+                if _buf and _seg_fh is not None:  # flush trailing partial line
+                    _seg_fh.write(_buf.decode("utf-8", "replace"))
+                break
+            _buf += chunk
+            # Split off complete lines; keep any trailing partial in _buf.
+            *lines, _buf = _buf.split(b"\n")
+            for raw in lines:
+                if _seg_fh is None:              # first frame -> new session
+                    open_segment()
+                _seg_fh.write(raw.decode("utf-8", "replace") + "\n")
+            if lines:
+                _last_frame = now
+
+        # Deadline checks: run every wake, whether or not a frame arrived.
+        if _seg_fh is not None:
+            if now - _last_frame >= IDLE:
+                close_segment("idle")            # session ended
+            elif now - _seg_start >= WINDOW:
+                close_segment("cont")            # session continues next segment
+finally:
+    close_segment("stop")
