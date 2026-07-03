@@ -416,7 +416,6 @@ dh clean    # or: rm -rf debian/canlogger debian/.debhelper debian/*.log debian/
 
 This package is deliberately not fully lintian-clean. The remaining issues:
 
-- **Maintainer / copyright fields** are placeholders, not real contact info.
 - **No upstream changelog** distinct from the Debian changelog.
 
 None of these affect the package working correctly; they would matter only if
