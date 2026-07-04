@@ -1,0 +1,8 @@
+# Pandoc's --standalone man template tests at build time whether the output
+# device has a real Courier ('C'/'CB') font family. Text devices (ascii/
+# utf8/latin1) -- the only kind `man` uses in a terminal -- don't, so the
+# probe itself, and one literal \f[C] used for indented code blocks, print
+# "cannot select font" to stderr. Pandoc's own template comments say this is
+# expected and already falls back to Bold for text devices; the rendered
+# man page is unaffected either way. Harmless, upstream-known noise.
+canlogger: groff-message

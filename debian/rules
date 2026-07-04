@@ -21,20 +21,6 @@ override_dh_auto_build:
 	pandoc --standalone --to man canlogger.7.md -o canlogger.7
 	pandoc --standalone --to man canlog-rotate.1.md -o canlog-rotate.1
 	pandoc --standalone --to man canlog-upload.1.md -o canlog-upload.1
-	# Pandoc's --standalone man output includes a 14-line preamble that tests
-	# for the CB (Courier Bold) groff font at runtime using:
-	#   .ie "\f[CB]x\f[]"x" \{...\}
-	#   .el \{...\}
-	# The test itself causes troff to warn "cannot select font 'CB'", and
-	# code blocks in the body use \f[C] which triggers "cannot select font
-	# 'C'".  Both warnings make lintian fail.  Strip the preamble with awk
-	# (skip from the ".\" Define V font" comment through the two .\} closers)
-	# and replace Courier/virtual-Courier font refs in the body with \f[B]
-	# (Bold), which is the fallback the preamble would have chosen anyway.
-	for f in canlogger.7 canlog-rotate.1 canlog-upload.1; do \
-		awk '/^\.\\" Define V font/{s=2;next} s>0{if(/^\.\\\}/)s--;next} 1' "$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"; \
-		sed -i 's/\\f\[C[BI]\{0,2\}\]/\\f[B]/g; s/\\f\[V[BI]\{0,2\}\]/\\f[B]/g' "$$f"; \
-	done
 	dh_auto_build
 
 override_dh_auto_clean:
