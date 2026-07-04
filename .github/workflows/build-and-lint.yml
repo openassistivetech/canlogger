@@ -22,3 +22,18 @@ jobs:
 
       - name: Run lintian
         run: lintian --fail-on error,warning ../*.changes
+
+  lint-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # canlog-upload is bash; shellcheck reads the shebang, so the
+      # extensionless filename is fine. shellcheck is preinstalled on the runner.
+      - name: ShellCheck (bash scripts)
+        run: shellcheck canlog-upload
+
+      # canlog-rotate is python3. ruff lints an explicitly-passed file
+      # regardless of extension. Pinned for reproducible CI; bump deliberately.
+      - name: Ruff (Python scripts)
+        run: pipx run ruff@0.15.20 check canlog-rotate
