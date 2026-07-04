@@ -21,6 +21,10 @@ override_dh_auto_build:
 	pandoc --standalone --to man canlogger.7.md -o canlogger.7
 	pandoc --standalone --to man canlog-rotate.1.md -o canlog-rotate.1
 	pandoc --standalone --to man canlog-upload.1.md -o canlog-upload.1
+	for f in canlogger.7 canlog-rotate.1 canlog-upload.1; do \
+		awk '/^\.\\" Define V font/{s=2;next} s>0{if(/^\.\\\}/)s--;next} 1' "$$f" > "$$f.tmp" && mv "$$f.tmp" "$$f"; \
+		sed -i 's/\\f\[C[BI]*\]/\\f[B]/g; s/\\f\[V[BI]*\]/\\f[B]/g' "$$f"; \
+	done
 	dh_auto_build
 
 override_dh_auto_clean:
