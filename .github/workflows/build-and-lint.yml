@@ -36,4 +36,4 @@ jobs:
       # canlog-rotate is python3. ruff lints an explicitly-passed file
       # regardless of extension. Pinned for reproducible CI; bump deliberately.
       - name: Ruff (Python scripts)
-        run: pipx run ruff@0.15.20 check canlog-rotate
+        run: pipx run --spec ruff==0.15.20 ruff check canlog-rotate
