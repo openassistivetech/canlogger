@@ -329,10 +329,11 @@ and aren't straightforward to install there. In order of least friction:
   Pi isn't fast in general, but this package is tiny (a few scripts, one
   pandoc invocation), so a full build takes only tens of seconds. Simplest
   option, and it puts the artifacts right where you'll test them.
-- **Build in Docker on macOS.** `docker run --rm -it -v "$PWD":/src debian:bookworm bash`,
+- **Build in Docker on macOS.** `docker run --rm -it -v "$PWD":/src debian:bookworm bash`, `apt update` then
   install the build deps inside, cd to /src and run `dpkg-buildpackage -us -uc -b`.
-  **The package will get built in `..`, so bring it into /src before you
-  exit docker.** The package is architecture-`all` (pure scripts, no compiled
+  **The package (`canlogger_[version]_all.deb`) will get built in `..`, so bring it into /src before you
+  exit docker; that will make sure it's present on your mac when you're done.**
+  The package is architecture-`all` (pure scripts, no compiled
   code), so an Apple Silicon Mac building a Debian package for an ARM Pi is fine — no
   cross-compilation concerns.
 - **Build on any Debian/Ubuntu box, then `scp` the `.deb` to the Pi.** Fastest
