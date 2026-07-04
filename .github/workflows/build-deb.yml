@@ -21,11 +21,13 @@ jobs:
         id: version
         run: echo "version=$(dpkg-parsechangelog -S Version)" >> "$GITHUB_OUTPUT"
 
+      - name: Collect build artifacts
+        run: |
+          mkdir -p artifacts
+          mv ../*.deb ../*.buildinfo ../*.changes artifacts/
+
       - name: Upload .deb
         uses: actions/upload-artifact@v4
         with:
           name: canlogger_${{ steps.version.outputs.version }}
-          path: |
-            ../*.deb
-            ../*.buildinfo
-            ../*.changes
+          path: artifacts/*
