@@ -312,6 +312,24 @@ the files it installs. Building produces a single `.deb` you can drop on any
 Pi (or other Debian-derivative system) running an `arm64`/`armhf` userland —
 the package is architecture-`all` since everything in it is a script.
 
+## Easiest: build it in GitHub Actions
+
+You don't have to build locally at all. The **Build .deb** workflow
+(`.github/workflows/build-deb.yml`) does the whole thing on a GitHub runner
+and hands you back the `.deb` as a downloadable artifact:
+
+1. Go to the repo's **Actions** tab → **Build .deb** → **Run workflow**.
+2. Pick the branch to build from (`main` or any feature branch — it's a
+   `workflow_dispatch`, so it runs on whatever ref you choose), then **Run
+   workflow**.
+3. When the run finishes (~40s), open it and download the
+   `canlogger_[version]` artifact from the **Artifacts** section. It's a zip
+   containing the `.deb` (plus the `.buildinfo`/`.changes` metadata).
+
+That's the path to prefer for a release build — no Debian toolchain on your
+machine required. Build locally (below) when you're iterating and want the
+`.deb` in hand immediately.
+
 ## Build host requirements
 
 Tooling (one-time, on whatever host you build from):
@@ -339,7 +357,7 @@ and aren't straightforward to install there. In order of least friction:
 - **Build on any Debian/Ubuntu box, then `scp` the `.deb` to the Pi.** Fastest
   if you already have such a machine handy.
 
-## Build
+## Build locally
 
 From the directory containing this README (i.e. the package source root):
 
