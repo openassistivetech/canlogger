@@ -317,7 +317,7 @@ the package is architecture-`all` since everything in it is a script.
 Tooling (one-time, on whatever host you build from):
 
 ```bash
-sudo apt install build-essential debhelper dpkg-dev pandoc
+sudo apt install build-essential debhelper dpkg-dev pandoc lintian
 ```
 
 You need a Debian/Ubuntu-style Linux for this — the Debian build tools
@@ -329,10 +329,11 @@ and aren't straightforward to install there. In order of least friction:
   Pi isn't fast in general, but this package is tiny (a few scripts, one
   pandoc invocation), so a full build takes only tens of seconds. Simplest
   option, and it puts the artifacts right where you'll test them.
-- **Build in Docker on macOS.** `docker run --rm -v "$PWD":/src debian:bookworm`,
-  install the build deps inside, run `dpkg-buildpackage -us -uc -b`. The
-  package is architecture-`all` (pure scripts, no compiled code), so an Apple
-  Silicon Mac building a Debian package for an ARM Pi is fine — no
+- **Build in Docker on macOS.** `docker run --rm -it -v "$PWD":/src debian:bookworm bash`,
+  install the build deps inside, cd to /src and run `dpkg-buildpackage -us -uc -b`.
+  **The package will get built in `..`, so bring it into /src before you
+  exit docker.** The package is architecture-`all` (pure scripts, no compiled
+  code), so an Apple Silicon Mac building a Debian package for an ARM Pi is fine — no
   cross-compilation concerns.
 - **Build on any Debian/Ubuntu box, then `scp` the `.deb` to the Pi.** Fastest
   if you already have such a machine handy.

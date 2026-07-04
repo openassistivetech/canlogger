@@ -11,16 +11,20 @@ override_dh_installsystemd:
 	dh_installsystemd --name=canlogger
 	dh_installsystemd --name=canlog-upload --no-enable --no-start
 
-# Generate the man page from markdown at build time. Keeping the source in
-# markdown means the doc is editable the same way as the README; pandoc emits
-# roff that man(1) reads. debhelper's dh_installman auto-installs *.7 from the
-# build tree into /usr/share/man/man7/.
+# Generate the man pages from markdown at build time. Keeping the source in
+# markdown means the docs are editable the same way as the README; pandoc
+# emits roff that man(1) reads. debhelper's dh_installman auto-installs
+# *.7/*.1 from the build tree into /usr/share/man/man7//man1/. The two *.1
+# pages exist only so lintian's no-manual-page check is satisfied for each
+# installed binary; they just point at canlogger(7) and the README.
 override_dh_auto_build:
 	pandoc --standalone --to man canlogger.7.md -o canlogger.7
+	pandoc --standalone --to man canlog-rotate.1.md -o canlog-rotate.1
+	pandoc --standalone --to man canlog-upload.1.md -o canlog-upload.1
 	dh_auto_build
 
 override_dh_auto_clean:
-	rm -f canlogger.7
+	rm -f canlogger.7 canlog-rotate.1 canlog-upload.1
 	dh_auto_clean
 
 # Leave /usr/share/doc/canlogger/README.md uncompressed. It's small (~18 KB)

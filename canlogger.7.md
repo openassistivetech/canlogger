@@ -41,4 +41,5 @@ canlog-upload.service, canlog-upload.timer
 
 # SEE ALSO
 
-**candump(1)**, **rclone(1)**, **systemctl(1)**, **journalctl(1)**
+**canlog-rotate(1)**, **canlog-upload(1)**, **candump(1)**, **rclone(1)**,
+**systemctl(1)**, **journalctl(1)**
