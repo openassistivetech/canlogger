@@ -242,6 +242,10 @@ def run_step(step: WizardStep) -> StepResult:
 
 def build_default_steps(include_drive_tests: bool) -> list[WizardStep]:
     """Define the main meet-and-greet path."""
+    drive_safety = (
+            "Use the slowest indoor profile, open space, and a spotter. Release the "
+            "joystick immediately if anything feels wrong."
+        )
     steps = [
         WizardStep(
             key="baseline_idle",
@@ -306,92 +310,60 @@ def build_default_steps(include_drive_tests: bool) -> list[WizardStep]:
             ),
             timeout_seconds=5.0,
         ),
+        WizardStep(
+            key="joystick_forward",
+            title="8. Joystick forward",
+            prompt=(
+                "When listening starts, gently hold the joystick forward until "
+                "the countdown ends, then release."
+            ),
+            timeout_seconds=5.0,
+            safety_note=drive_safety,
+        ),
+        WizardStep(
+            key="joystick_reverse",
+            title="9. Joystick reverse",
+            prompt=(
+                "When listening starts, gently hold the joystick backward until "
+                "the countdown ends, then release."
+            ),
+            timeout_seconds=5.0,
+            safety_note=drive_safety,
+        ),
+        WizardStep(
+            key="joystick_left",
+            title="10. Joystick left",
+            prompt=(
+                "When listening starts, gently hold the joystick left until "
+                "the countdown ends, then release."
+            ),
+            timeout_seconds=5.0,
+            safety_note=drive_safety,
+        ),
+        WizardStep(
+            key="joystick_right",
+            title="11. Joystick right",
+            prompt=(
+                "When listening starts, gently hold the joystick right until "
+                "the countdown ends, then release."
+            ),
+            timeout_seconds=5.0,
+            safety_note=drive_safety,
+        ),
+        WizardStep(
+            key="motor_current",
+            title="12. Motor current / motion gate",
+            prompt=(
+                "When listening starts, perform one small gentle drive movement "
+                "and return to center. The future version will look for motor "
+                "current or motion-state candidates."
+            ),
+            timeout_seconds=8.0,
+            safety_note=drive_safety,
+        ), 
+    
     ]
 
-    if include_drive_tests:
-        drive_safety = (
-            "Use the slowest indoor profile, open space, and a spotter. Release the "
-            "joystick immediately if anything feels wrong."
-        )
-        steps.extend(
-            [
-                WizardStep(
-                    key="joystick_forward",
-                    title="8. Joystick forward",
-                    prompt=(
-                        "When listening starts, gently hold the joystick forward until "
-                        "the countdown ends, then release."
-                    ),
-                    timeout_seconds=5.0,
-                    safety_note=drive_safety,
-                ),
-                WizardStep(
-                    key="joystick_reverse",
-                    title="9. Joystick reverse",
-                    prompt=(
-                        "When listening starts, gently hold the joystick backward until "
-                        "the countdown ends, then release."
-                    ),
-                    timeout_seconds=5.0,
-                    safety_note=drive_safety,
-                ),
-                WizardStep(
-                    key="joystick_left",
-                    title="10. Joystick left",
-                    prompt=(
-                        "When listening starts, gently hold the joystick left until "
-                        "the countdown ends, then release."
-                    ),
-                    timeout_seconds=5.0,
-                    safety_note=drive_safety,
-                ),
-                WizardStep(
-                    key="joystick_right",
-                    title="11. Joystick right",
-                    prompt=(
-                        "When listening starts, gently hold the joystick right until "
-                        "the countdown ends, then release."
-                    ),
-                    timeout_seconds=5.0,
-                    safety_note=drive_safety,
-                ),
-                WizardStep(
-                    key="motor_current",
-                    title="12. Motor current / motion gate",
-                    prompt=(
-                        "When listening starts, perform one small gentle drive movement "
-                        "and return to center. The future version will look for motor "
-                        "current or motion-state candidates."
-                    ),
-                    timeout_seconds=8.0,
-                    safety_note=drive_safety,
-                ),
-            ]
-        )
-    else:
-        steps.append(
-            WizardStep(
-                key="drive_tests_skipped",
-                title="8. Drive tests skipped",
-                prompt=(
-                    "Drive/joystick movement tests are disabled for this run. This is "
-                    "the safer mode for bench testing horn/lights/buttons only."
-                ),
-                timeout_seconds=0.1,
-            )
-        )
-
-    steps.append(
-        WizardStep(
-            key="final_review",
-            title="Final review",
-            prompt=(
-                "Review the placeholder results. Future versions will show confirmed, "
-                "candidate, and not-observed mappings here."
-            ),
-            timeout_seconds=0.1,
-        )
-    )
     return steps
 
 
