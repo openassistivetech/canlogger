@@ -3,19 +3,8 @@
 rnet_meet_greet_skeleton.py - Passive R-Net chair capability discovery wizard.
 
 Purpose:
-  Interactive wizard script that helps map chair-specific R-Net frames on a new wheelchair.
-  It will prompt users through a series of steps, like "honk the horn", "toggle the left indicator", etc.
-  For each interaction step it will listen for 10 seconds and write the log snippet to a file. 
-  After the session we will have a json file containing the results, a txt file with a summary that's easy to read 
-  and raw logs in the following folder structure: 
-  meet_greet_log_snippets/
-    horn_honk/
-    left_indicator/
-    short_drive_forward/
-The resulting logs would have UTC timestamp and status of the listening session and will look like this:
-meet_greet_log_snippets/horn_honk/20260711T164233Z_candidate.log
-meet_greet_log_snippets/horn_honk/20260711T164402Z_timeout.log
-meet_greet_log_snippets/left_indicator/20260711T164915Z_confirmed.log
+  This is the core bones / interaction flow for a future "meet and greet"
+  script that helps map chair-specific R-Net frames on a new wheelchair.
 
 Design goals:
   - Passive by default: listen/recognize, do not transmit.
@@ -23,6 +12,7 @@ Design goals:
   - Skippable: every step can be skipped.
   - Timeout-aware: each step listens for a bounded time window.
   - Evidence-based: later versions should store confirmed/candidate/not-observed.
+  - Safety-scoped: do not discover or transmit drive, seating, mode, or config frames.
 
 This skeleton intentionally does NOT implement CAN recognition yet.
 Expectation and recognition sections are placeholders to fill in later.
@@ -43,19 +33,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 import time
 from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 
 StepStatus = Literal["not_run", "skipped", "timeout", "candidate", "confirmed", "failed"]
 
-LOG_SNIPPET_ROOT_DEFAULT = "meet_greet_log_snippets"
-LISTEN_SECONDS_DEFAULT = 10.0
 
 @dataclass
 class StepResult:
@@ -153,124 +139,8 @@ class WizardStep:
 # Current runnable skeleton helpers
 # -----------------------------------------------------------------------------
 
-def slugify(text: str) -> str:
-    """Turn a step name / label into a safe folder or filename component."""
-    # Example:
-    # slugify("Joystick Button: Left Indicator On/Off")
-    # joystick_button_left_indicator_on_off
-    text = text.strip().lower()
-    text = re.sub(r"[^a-z0-9]+", "_", text)
-    text = re.sub(r"_+", "_", text)
-    return text.strip("_") or "unnamed"
-
-
-def ensure_log_root(root: str | Path) -> Path:
-    root_path = Path(root)
-    root_path.mkdir(parents=True, exist_ok=True)
-    return root_path
-
-
-def ensure_step_log_dir(root: Path, step_name: str) -> Path:
-    step_dir = root / slugify(step_name)
-    step_dir.mkdir(parents=True, exist_ok=True)
-    return step_dir
-
-
-def utc_timestamp_for_filename() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def build_listening_session_path(
-    root: Path,
-    step_name: str,
-    label: str,
-    *,
-    suffix: str = ".log",
-) -> Path:
-    step_dir = ensure_step_log_dir(root, step_name)
-    ts = utc_timestamp_for_filename()
-    safe_label = slugify(label)
-    return step_dir / f"{ts}_{safe_label}{suffix}"
-
-
-def write_listening_session(
-    root: Path,
-    *,
-    step_name: str,
-    label: str,
-    lines: list[str],
-    notes: str = "",
-) -> Path:
-    path = build_listening_session_path(root, step_name, label)
-
-    with path.open("w", encoding="utf-8") as f:
-        f.write(f"# step: {step_name}\n")
-        f.write(f"# label: {label}\n")
-        f.write(f"# captured_utc: {datetime.now(timezone.utc).isoformat()}\n")
-        if notes:
-            f.write(f"# notes: {notes}\n")
-        f.write("\n")
-
-        for line in lines:
-            f.write(line.rstrip("\n") + "\n")
-
-    return path
-
-def collect_listening_lines_for_step(step_name: str, seconds: float) -> list[str]:
-    """
-    TODO: Replace this with real CAN collection.
-
-    Future behavior:
-      - open python-can bus or use existing bus
-      - collect frames for `seconds`
-      - format each as candump-style text:
-          (timestamp) can0 ID#DATA
-      - return list[str]
-    """
-    print(f"[TODO] Listening for {seconds:.1f}s for step: {step_name}")
-    print("[TODO] Real CAN collection will go here later.")
-    return []
-
-
-def format_can_message(msg, interface: str = "can0") -> str:
-    """
-    Format a python-can Message in candump-like style.
-
-    Example:
-      (1783377282.654466) can0 02000200#0000
-    """
-    arbitration_id = f"{msg.arbitration_id:08X}" if msg.is_extended_id else f"{msg.arbitration_id:03X}"
-    data = msg.data.hex().upper()
-    timestamp = getattr(msg, "timestamp", None)
-    if timestamp is None:
-        timestamp = datetime.now(timezone.utc).timestamp()
-    return f"({timestamp:.6f}) {interface} {arbitration_id}#{data}"
-
-def ask_user_for_step_result() -> str:
-    """Ask how to label the listening window."""
-    choice = ask_choice(
-        "Label this listening session as candidate, timeout, retry, skip, failed, or quit?",
-        {"c", "t", "r", "s", "f", "q"},
-        default="c",
-    )
-
-    if choice == "c":
-        return "candidate"
-    if choice == "t":
-        return "timeout"
-    if choice == "r":
-        return "retry"
-    if choice == "s":
-        return "skipped"
-    if choice == "f":
-        return "failed"
-    if choice == "q":
-        return "quit"
-
-    return "unclear"
-
 def timestamp() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S local time") + " (" + utc_timestamp_for_filename() + " UTC)"
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def ask_choice(prompt: str, choices: set[str], default: str | None = None) -> str:
@@ -301,7 +171,7 @@ def wait_countdown(seconds: float, *, label: str = "Listening") -> None:
     sys.stdout.flush()
 
 
-def run_step(step: WizardStep, log_root: Path, listen_seconds: float) -> StepResult:
+def run_step(step: WizardStep) -> StepResult:
     """Run one skippable wizard step with a timeout placeholder."""
     print("\n" + "=" * 78)
     print(step.title)
@@ -319,13 +189,6 @@ def run_step(step: WizardStep, log_root: Path, listen_seconds: float) -> StepRes
     if choice == "q":
         raise KeyboardInterrupt
     if choice == "s":
-        write_listening_session(
-            log_root,
-            step_name=step.key,
-            label="skipped",
-            lines=[],
-            notes=f"User skipped this step.",
-        )
         return StepResult(
             key=step.key,
             title=step.title,
@@ -333,58 +196,38 @@ def run_step(step: WizardStep, log_root: Path, listen_seconds: float) -> StepRes
             notes=["User skipped this step."],
         )
 
-
     # Future expectation section would be called here.
     # Example:
     # baseline = collect_baseline(bus, BASELINE_SECONDS)
     # action_frames = collect_action_window(bus, step.timeout_seconds)
     # recognition = recognize_...(baseline, action_frames)
 
-    lines = collect_listening_lines_for_step(
-        step.key,
-        seconds=listen_seconds,
-    )
+    wait_countdown(step.timeout_seconds)
 
     print("Recognition is not implemented yet in this skeleton.")
-    
-    label = ask_user_for_step_result()
-
-    snippet_path = write_listening_session(
-        log_root,
-        step_name=step.key,
-        label=label,
-        lines=lines,
-        notes=f"title={step.title}; timeout_seconds={step.timeout_seconds}",
+    post = ask_choice(
+        "Mark this placeholder step as candidate, timeout, retry, skip, or quit?",
+        {"c", "t", "r", "s", "q"},
+        default="c",
     )
-
-    print(f"Saved listening snippet: {snippet_path}")
-
-    if label == "quit":
+    if post == "q":
         raise KeyboardInterrupt
-    if label == "retry":
-        return run_step(step, log_root, listen_seconds)
-    if label == "skipped":
+    if post == "r":
+        return run_step(step)
+    if post == "s":
         return StepResult(
             key=step.key,
             title=step.title,
             status="skipped",
             notes=["User skipped after listening window."],
         )
-    if label == "timeout":
+    if post == "t":
         return StepResult(
             key=step.key,
             title=step.title,
             status="timeout",
             notes=["Listening window completed; no recognition logic implemented yet."],
         )
-    if label == "failed":
-        return StepResult(
-            key=step.key,
-            title=step.title,
-            status="failed",
-            notes=["User marked this listening window as failed."],
-        )
-
     return StepResult(
         key=step.key,
         title=step.title,
@@ -397,7 +240,7 @@ def run_step(step: WizardStep, log_root: Path, listen_seconds: float) -> StepRes
     )
 
 
-def build_default_steps() -> list[WizardStep]:
+def build_default_steps(include_drive_tests: bool) -> list[WizardStep]:
     """Define the main meet-and-greet path."""
     drive_safety = (
             "Use the slowest indoor profile, open space, and a spotter. Release the "
@@ -568,31 +411,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bustype", default="socketcan")
     p.add_argument("--profile-name", default="unnamed-chair")
     p.add_argument(
+        "--include-drive-tests",
+        action="store_true",
+        help="include joystick/motor movement prompts; default is horn/lights/buttons only",
+    )
+    p.add_argument(
         "--output",
         default="rnet_meet_greet_profile.json",
         help="path for placeholder JSON profile output",
-    )
-    p.add_argument(
-        "--log-snippet-root",
-        default=LOG_SNIPPET_ROOT_DEFAULT,
-        help=f"Directory where per-step listening snippets are written "
-            f"(default: {LOG_SNIPPET_ROOT_DEFAULT})",
-    )
-    p.add_argument(
-        "--listen-seconds",
-        type=float,
-        default=LISTEN_SECONDS_DEFAULT,
-        help=f"Seconds to listen for each interactive step "
-            f"(default: {LISTEN_SECONDS_DEFAULT})",
     )
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    log_root = ensure_log_root(args.log_snippet_root)
     profile = build_profile(args)
-    steps = build_default_steps()
+    steps = build_default_steps(include_drive_tests=args.include_drive_tests)
 
     print("R-Net Meet & Greet skeleton")
     print("This version does not read CAN yet. It only exercises the user-guided flow.")
@@ -601,7 +435,7 @@ def main() -> int:
 
     try:
         for step in steps:
-            result = run_step(step, log_root, args.listen_seconds)
+            result = run_step(step)
             profile.steps[result.key] = result
             save_json_profile(profile, Path(args.output))
     except KeyboardInterrupt:
