@@ -412,3 +412,17 @@ To clean build artifacts:
 ```bash
 dh clean    # or: rm -rf debian/canlogger debian/.debhelper debian/*.log debian/*.substvars
 ```
+
+# Virtual dev environment set up
+
+Use `Dockerfile` and `compose` to set up a virtual environment similar to rpi for development purposes.
+
+# Meet and Greet 
+
+`rnet_meet_greet.py` - interactive script to run on a new chair to learn it's parameters for future work. You need to be sshed into the rpi in order to run it and interact with it. The script generates 2 files: 
+ - `rnet_meet_greet_profile.json` which will be eventually be used as input to other scripts (like beeper script)
+ - `rnet_meet_greet_report.txt` which is a human readable info on what we were able to identify and can work with and what data wasn't recognized (for instance the horn wasn't registered, so we won't succeed running the beeper script) 
+
+ # Direction beeper 
+
+ `direction_beeper.py` makes the chair beep in a predefined pattern, changing the pattern between driving forward, backward, left and right. 

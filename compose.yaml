@@ -1,0 +1,13 @@
+services:
+  canlogger-dev:
+    build: .
+    image: canlogger-dev:trixie
+    container_name: canlogger-dev
+    working_dir: /work
+    volumes:
+      - .:/work
+    stdin_open: true
+    tty: true
+    privileged: true
+    cap_add:
+      - NET_ADMIN
