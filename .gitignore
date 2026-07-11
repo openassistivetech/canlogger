@@ -11,6 +11,4 @@ debian/*.debhelper*
 /canlog-rotate.1
 /canlog-upload.1
 
-/rnet_meet_greet_report.txt
-/rnet_meet_greet_profile.json
-/meet_greet_log_snippets/
+/meet_greet_files

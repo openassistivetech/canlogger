@@ -56,6 +56,7 @@ StepStatus = Literal["not_run", "skipped", "timeout", "candidate", "confirmed", 
 
 LOG_SNIPPET_ROOT_DEFAULT = "meet_greet_log_snippets"
 LISTEN_SECONDS_DEFAULT = 10.0
+MEET_GREET_FILES_ROOT_DEFAULT = "meet_greet_files"
 
 @dataclass
 class StepResult:
@@ -163,6 +164,25 @@ def slugify(text: str) -> str:
     text = re.sub(r"_+", "_", text)
     return text.strip("_") or "unnamed"
 
+def resolve_runtime_path(files_root: Path, path_value: str | Path | None) -> Path | None:
+    """
+    Resolve user/runtime paths under the meet-greet files root.
+
+    Rules:
+      - None stays None.
+      - Absolute paths are respected.
+      - Relative paths are placed under files_root.
+    """
+    if path_value is None:
+        return None
+
+    path = Path(path_value)
+
+    if path.is_absolute():
+        return path
+
+    return files_root / path
+
 
 def ensure_log_root(root: str | Path) -> Path:
     root_path = Path(root)
@@ -191,6 +211,81 @@ def build_listening_session_path(
     ts = utc_timestamp_for_filename()
     safe_label = slugify(label)
     return step_dir / f"{ts}_{safe_label}{suffix}"
+
+def load_saved_snippet_for_step(
+    replay_root: Path,
+    step_key: str,
+    *,
+    pick: str = "ask",
+) -> tuple[list[str], Path | None]:
+    """
+    Load an existing saved log snippet for this step.
+
+    Expected folder structure:
+      replay_root/
+        horn/
+          20260711T164233Z_candidate.log
+        left_indicator/
+          20260711T164915Z_confirmed.log
+
+    Returns:
+      (lines, source_path)
+    """
+    step_dir = replay_root / slugify(step_key)
+
+    if not step_dir.exists():
+        print(f"No replay folder found for step: {step_key}")
+        print(f"Expected: {step_dir}")
+        return [], None
+
+    candidates = sorted(step_dir.glob("*.log"))
+
+    if not candidates:
+        print(f"No .log snippets found for step: {step_key}")
+        print(f"Folder: {step_dir}")
+        return [], None
+
+    if pick == "latest":
+        chosen = max(candidates, key=lambda p: p.stat().st_mtime)
+    elif pick == "first":
+        chosen = candidates[0]
+    else:
+        print()
+        print(f"Available saved snippets for step '{step_key}':")
+        for i, path in enumerate(candidates, start=1):
+            print(f"  {i}. {path.name}")
+
+        while True:
+            raw = input("Choose snippet number, or Enter for latest: ").strip()
+            if not raw:
+                chosen = max(candidates, key=lambda p: p.stat().st_mtime)
+                break
+            try:
+                index = int(raw)
+            except ValueError:
+                print("Please enter a number.")
+                continue
+            if 1 <= index <= len(candidates):
+                chosen = candidates[index - 1]
+                break
+            print(f"Please enter a number from 1 to {len(candidates)}.")
+
+    raw_lines = chosen.read_text(encoding="utf-8").splitlines()
+
+    # Keep only actual CAN-ish lines for future recognition logic.
+    # This skips metadata headers like:
+    #   # step: horn
+    #   # label: candidate
+    lines = [
+        line
+        for line in raw_lines
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+    print(f"Loaded replay snippet: {chosen}")
+    print(f"Loaded {len(lines)} CAN/log lines.")
+
+    return lines, chosen
 
 
 def write_listening_session(
@@ -301,7 +396,33 @@ def wait_countdown(seconds: float, *, label: str = "Listening") -> None:
     sys.stdout.flush()
 
 
-def run_step(step: WizardStep, log_root: Path, listen_seconds: float) -> StepResult:
+def run_step(
+    step: WizardStep,
+    log_root: Path,
+    listen_seconds: float,
+    *,
+    replay_root: Path | None = None,
+    replay_pick: str = "ask",
+) -> StepResult:
+    if replay_root is not None:
+        return run_replay_step(
+            step,
+            log_root,
+            replay_root=replay_root,
+            replay_pick=replay_pick,
+        )
+
+    return run_live_step(
+        step,
+        log_root,
+        listen_seconds,
+    )
+
+def run_live_step(
+    step: WizardStep,
+    log_root: Path,
+    listen_seconds: float,
+) -> StepResult:
     """Run one skippable wizard step with a timeout placeholder."""
     print("\n" + "=" * 78)
     print(step.title)
@@ -333,12 +454,8 @@ def run_step(step: WizardStep, log_root: Path, listen_seconds: float) -> StepRes
             notes=["User skipped this step."],
         )
 
+    source_path = None
 
-    # Future expectation section would be called here.
-    # Example:
-    # baseline = collect_baseline(bus, BASELINE_SECONDS)
-    # action_frames = collect_action_window(bus, step.timeout_seconds)
-    # recognition = recognize_...(baseline, action_frames)
 
     lines = collect_listening_lines_for_step(
         step.key,
@@ -349,12 +466,14 @@ def run_step(step: WizardStep, log_root: Path, listen_seconds: float) -> StepRes
     
     label = ask_user_for_step_result()
 
+    notes = f"title={step.title}; timeout_seconds={step.timeout_seconds}; source=live_or_stub"
+
     snippet_path = write_listening_session(
         log_root,
         step_name=step.key,
         label=label,
         lines=lines,
-        notes=f"title={step.title}; timeout_seconds={step.timeout_seconds}",
+        notes=notes,
     )
 
     print(f"Saved listening snippet: {snippet_path}")
@@ -362,7 +481,11 @@ def run_step(step: WizardStep, log_root: Path, listen_seconds: float) -> StepRes
     if label == "quit":
         raise KeyboardInterrupt
     if label == "retry":
-        return run_step(step, log_root, listen_seconds)
+        return run_live_step(
+            step,
+            log_root,
+            listen_seconds
+        )
     if label == "skipped":
         return StepResult(
             key=step.key,
@@ -392,6 +515,83 @@ def run_step(step: WizardStep, log_root: Path, listen_seconds: float) -> StepRes
         notes=["Placeholder only. Recognition logic not implemented yet."],
         observations={
             "timeout_seconds": step.timeout_seconds,
+            "implemented": False,
+        },
+    )
+
+def run_replay_step(
+    step: WizardStep,
+    log_root: Path,
+    replay_root: Path | None = None,
+    replay_pick: str = "ask",
+) -> StepResult:
+    """Run one step using an existing saved log snippet, not live chair actions."""
+    print("\n" + "=" * 78)
+    print(step.title)
+    print("=" * 78)
+    print("Replay mode: choose an existing saved snippet for this step.")
+    print(f"Expected folder: {replay_root / slugify(step.key)}")
+    print()
+
+    lines, source_path = load_saved_snippet_for_step(
+        replay_root,
+        step.key,
+        pick=replay_pick,
+    )
+
+    if source_path is None:
+        label = "timeout"
+        snippet_path = write_listening_session(
+            log_root,
+            step_name=step.key,
+            label=label,
+            lines=[],
+            notes=f"title={step.title}; replay_source=missing; source=replay",
+        )
+        print(f"Saved empty replay result: {snippet_path}")
+        return StepResult(
+            key=step.key,
+            title=step.title,
+            status="timeout",
+            notes=["Replay mode: no saved snippet was available for this step."],
+            observations={
+                "source": "replay",
+                "replay_source": None,
+                "line_count": 0,
+            },
+        )
+
+    print("Recognition is not implemented yet in this skeleton.")
+    print("This replay file will be treated as the candidate evidence for this step.")
+    print()
+
+    notes = (
+        f"title={step.title}; "
+        f"replay_source={source_path}; "
+        f"source=replay"
+    )
+
+    label="candidate"
+
+    snippet_path = write_listening_session(
+        log_root,
+        step_name=step.key,
+        label=label,
+        lines=lines,
+        notes=notes,
+    )
+
+    print(f"Saved replay-derived snippet: {snippet_path}")
+
+    return StepResult(
+        key=step.key,
+        title=step.title,
+        status=label,
+        notes=[f"Replay mode: loaded saved snippet from {source_path}."],
+        observations={
+            "source": "replay",
+            "replay_source": str(source_path),
+            "line_count": len(lines),
             "implemented": False,
         },
     )
@@ -585,34 +785,76 @@ def parse_args() -> argparse.Namespace:
         help=f"Seconds to listen for each interactive step "
             f"(default: {LISTEN_SECONDS_DEFAULT})",
     )
+    p.add_argument(
+        "--replay-log-root",
+        default=None,
+        help=(
+            "Read existing per-step log snippets instead of listening to live CAN. "
+            "Expected structure: ROOT/step_key/*.log"
+        ),
+    )
+    p.add_argument(
+        "--replay-pick",
+        choices={"ask", "latest", "first"},
+        default="ask",
+        help="How to choose a snippet when replaying saved logs (default: ask)",
+    )
+    p.add_argument(
+        "--files-root",
+        default=MEET_GREET_FILES_ROOT_DEFAULT,
+        help=(
+            "Parent directory for generated meet-and-greet files "
+            f"(default: {MEET_GREET_FILES_ROOT_DEFAULT})"
+        ),
+    )
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    log_root = ensure_log_root(args.log_snippet_root)
+    files_root = Path(args.files_root)
+    files_root.mkdir(parents=True, exist_ok=True)
+    output_path = resolve_runtime_path(files_root, args.output)
+    log_root = ensure_log_root(resolve_runtime_path(files_root, args.log_snippet_root))
+    replay_root = resolve_runtime_path(files_root, args.replay_log_root)
+    resolved_log_root = resolve_runtime_path(files_root, args.log_snippet_root)
+    assert resolved_log_root is not None
+    log_root = ensure_log_root(resolved_log_root)
+
     profile = build_profile(args)
     steps = build_default_steps()
 
     print("R-Net Meet & Greet skeleton")
     print("This version does not read CAN yet. It only exercises the user-guided flow.")
-    print("Output profile: %s" % args.output)
+    print("Files root: %s" % files_root)
+    print("Output profile: %s" % output_path)
+    print("Log snippets: %s" % log_root)
     print()
+    if replay_root is not None:
+        print(f"Replay mode: reading snippets from {replay_root}")
+    else:
+        print("Live/stub mode: collecting from current listener")
 
     try:
         for step in steps:
-            result = run_step(step, log_root, args.listen_seconds)
+            result = run_step(
+                step,
+                log_root,
+                args.listen_seconds,
+                replay_root=replay_root,
+                replay_pick=args.replay_pick,
+            )
             profile.steps[result.key] = result
-            save_json_profile(profile, Path(args.output))
+            save_json_profile(profile, output_path)
     except KeyboardInterrupt:
         print("\nWizard interrupted. Saving partial placeholder profile...")
-        save_json_profile(profile, Path(args.output))
+        save_json_profile(profile, output_path)
         print_summary(profile)
         return 130
 
-    save_json_profile(profile, Path(args.output))
+    save_json_profile(profile, output_path)
     print_summary(profile)
-    print("Saved placeholder profile to: %s" % args.output)
+    print("Saved placeholder profile to: %s" % output_path)
     return 0
 
 
