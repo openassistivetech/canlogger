@@ -13,3 +13,4 @@ debian/*.debhelper*
 
 /rnet_meet_greet_report.txt
 /rnet_meet_greet_profile.json
+/meet_greet_log_snippets/
