@@ -58,6 +58,10 @@ LOG_SNIPPET_ROOT_DEFAULT = "meet_greet_log_snippets"
 LISTEN_SECONDS_DEFAULT = 10.0
 MEET_GREET_FILES_ROOT_DEFAULT = "meet_greet_files"
 
+# Known R-Net frame IDs
+HORN_START_ID = 0x0C040100
+HORN_STOP_ID = 0x0C040101
+
 @dataclass
 class StepResult:
     """One wizard step result. Recognition details will be added later."""
@@ -96,7 +100,51 @@ class WizardStep:
     safety_note: str = ""
     optional: bool = True
 
+CAN_LOG_LINE_RE = re.compile(
+    r"^\((?P<timestamp>\d+(?:\.\d+)?)\)\s+"
+    r"(?P<interface>\S+)\s+"
+    r"(?P<can_id>[0-9A-Fa-f]+)#(?P<data>[0-9A-Fa-f]*)"
+)
 
+
+def parse_can_log_line(line: str) -> dict[str, Any] | None:
+    """
+    Parse a candump-style line.
+
+    Example:
+      (1783377282.654466) can0 02000200#0000
+
+    Returns:
+      {
+        "timestamp": 1783377282.654466,
+        "interface": "can0",
+        "can_id": 0x02000200,
+        "can_id_hex": "02000200",
+        "data_hex": "0000",
+        "raw": original line,
+      }
+    """
+    match = CAN_LOG_LINE_RE.match(line.strip())
+    if not match:
+        return None
+
+    can_id_text = match.group("can_id").upper()
+    data_hex = match.group("data").upper()
+
+    try:
+        timestamp_value = float(match.group("timestamp"))
+        can_id_value = int(can_id_text, 16)
+    except ValueError:
+        return None
+
+    return {
+        "timestamp": timestamp_value,
+        "interface": match.group("interface"),
+        "can_id": can_id_value,
+        "can_id_hex": can_id_text.zfill(8),
+        "data_hex": data_hex,
+        "raw": line.rstrip("\n"),
+    }
 # -----------------------------------------------------------------------------
 # Future expectation / recognition stubs
 # -----------------------------------------------------------------------------
@@ -149,9 +197,121 @@ class WizardStep:
 #     """Future: write a friendly report of confirmed/candidate/not-observed items."""
 #     pass
 
+def recognize_horn_start_stop(lines: list[str]) -> dict[str, Any]:
+    """
+    Recognize a simple R-Net horn start/stop pattern.
 
+    Known-good candidate from prior testing:
+      horn start: 0C040100#
+      horn stop:  0C040101#
+
+    This recognizer is intentionally conservative:
+      - It does not transmit.
+      - It does not assume the horn worked physically.
+      - It only reports whether the expected start/stop frames appear.
+    """
+    parsed_frames: list[dict[str, Any]] = []
+
+    for line in lines:
+        frame = parse_can_log_line(line)
+        if frame is not None:
+            parsed_frames.append(frame)
+
+    start_events = [
+        frame for frame in parsed_frames
+        if frame["can_id"] == HORN_START_ID
+    ]
+
+    stop_events = [
+        frame for frame in parsed_frames
+        if frame["can_id"] == HORN_STOP_ID
+    ]
+
+    pairs: list[dict[str, Any]] = []
+    unused_stops = stop_events.copy()
+
+    for start in start_events:
+        matching_stop = None
+        for stop in unused_stops:
+            if stop["timestamp"] >= start["timestamp"]:
+                matching_stop = stop
+                break
+
+        if matching_stop is not None:
+            unused_stops.remove(matching_stop)
+            pairs.append(
+                {
+                    "start_timestamp": start["timestamp"],
+                    "stop_timestamp": matching_stop["timestamp"],
+                    "duration_seconds": round(
+                        matching_stop["timestamp"] - start["timestamp"],
+                        6,
+                    ),
+                    "start_line": start["raw"],
+                    "stop_line": matching_stop["raw"],
+                }
+            )
+
+    if pairs:
+        recognition_status = "confirmed"
+        summary = (
+            f"Found {len(pairs)} horn start/stop pair(s): "
+            f"0x{HORN_START_ID:08X} -> 0x{HORN_STOP_ID:08X}."
+        )
+    elif start_events or stop_events:
+        recognition_status = "candidate"
+        summary = (
+            "Found partial horn evidence: "
+            f"{len(start_events)} start frame(s), "
+            f"{len(stop_events)} stop frame(s)."
+        )
+    else:
+        recognition_status = "not_observed"
+        summary = "No horn start/stop frames observed."
+
+    return {
+        "recognizer": "horn_start_stop",
+        "implemented": True,
+        "status": recognition_status,
+        "summary": summary,
+        "expected_start_id": f"0x{HORN_START_ID:08X}",
+        "expected_stop_id": f"0x{HORN_STOP_ID:08X}",
+        "line_count": len(lines),
+        "parsed_frame_count": len(parsed_frames),
+        "start_count": len(start_events),
+        "stop_count": len(stop_events),
+        "pair_count": len(pairs),
+        "pairs": pairs,
+    }
+
+def recognize_step(step_key: str, lines: list[str]) -> dict[str, Any]:
+    """
+    Dispatch step-specific recognition.
+
+    More recognizers will be added here later:
+      - lights
+      - joystick axes
+      - motor current
+      - seating
+    """
+    if step_key == "horn":
+        return recognize_horn_start_stop(lines)
+
+    return {
+        "recognizer": None,
+        "implemented": False,
+        "status": "not_implemented",
+        "summary": f"No recognizer implemented yet for step '{step_key}'.",
+        "line_count": len(lines),
+    }
+
+def print_recognition_summary(recognition: dict[str, Any]) -> None:
+    print()
+    print("Recognition:")
+    print("  status:  %s" % recognition.get("status", "unknown"))
+    print("  summary: %s" % recognition.get("summary", "No summary."))
 # -----------------------------------------------------------------------------
-# Current runnable skeleton helpers
+# Helper functions
 # -----------------------------------------------------------------------------
 
 def slugify(text: str) -> str:
@@ -462,7 +622,8 @@ def run_live_step(
         seconds=listen_seconds,
     )
 
-    print("Recognition is not implemented yet in this skeleton.")
+    recognition = recognize_step(step.key, lines)
+    print_recognition_summary(recognition)
     
     label = ask_user_for_step_result()
 
@@ -512,10 +673,10 @@ def run_live_step(
         key=step.key,
         title=step.title,
         status="candidate",
-        notes=["Placeholder only. Recognition logic not implemented yet."],
+        notes=["Recognition partially implemented."],
         observations={
             "timeout_seconds": step.timeout_seconds,
-            "implemented": False,
+            "recognition": recognition,
         },
     )
 
@@ -558,13 +719,13 @@ def run_replay_step(
                 "source": "replay",
                 "replay_source": None,
                 "line_count": 0,
+                "recognition": recognition,
             },
         )
 
-    print("Recognition is not implemented yet in this skeleton.")
-    print("This replay file will be treated as the candidate evidence for this step.")
-    print()
-
+    recognition = recognize_step(step.key, lines)
+    print_recognition_summary(recognition)
+    
     notes = (
         f"title={step.title}; "
         f"replay_source={source_path}; "
@@ -592,7 +753,7 @@ def run_replay_step(
             "source": "replay",
             "replay_source": str(source_path),
             "line_count": len(lines),
-            "implemented": False,
+            "recognition": recognition, 
         },
     )
 
