@@ -81,6 +81,8 @@ LAMP_RIGHT = 0x04
 LAMP_FLOOD_HEADLIGHT = 0x80
 
 # Optional programmer-diagnostics versions
+PROGRAMMER_HORN_START_ID = 0x0C040F00
+PROGRAMMER_HORN_STOP_ID = 0x0C040F01
 PROGRAMMER_HAZARD_TOGGLE_ID = 0x0C000F03
 PROGRAMMER_LEFT_INDICATOR_TOGGLE_ID = 0x0C000F01
 PROGRAMMER_RIGHT_INDICATOR_TOGGLE_ID = 0x0C000F02
@@ -836,16 +838,20 @@ def infer_joystick_id_from_idle_frames(
 
 def recognize_horn_start_stop(lines: list[str]) -> dict[str, Any]:
     """
-    Recognize a simple R-Net horn start/stop pattern.
+    Recognize R-Net horn start/stop patterns.
 
-    Known-good candidate from prior testing:
+    Joystick button evidence:
       horn start: 0C040100#
       horn stop:  0C040101#
+
+    Programmer/diagnostic evidence:
+      horn start: 0C040F00#
+      horn stop:  0C040F01#
 
     This recognizer is intentionally conservative:
       - It does not transmit.
       - It does not assume the horn worked physically.
-      - It only reports whether the expected start/stop frames appear.
+      - It reports whether joystick and/or programmer horn frames appear.
     """
     parsed_frames: list[dict[str, Any]] = []
 
@@ -854,69 +860,159 @@ def recognize_horn_start_stop(lines: list[str]) -> dict[str, Any]:
         if frame is not None:
             parsed_frames.append(frame)
 
-    start_events = [
-        frame for frame in parsed_frames if frame["can_id"] == HORN_START_ID
-    ]
+    def find_events(start_id: int, stop_id: int) -> dict[str, Any]:
+        start_events = [
+            frame for frame in parsed_frames
+            if frame["can_id"] == start_id
+        ]
 
-    stop_events = [frame for frame in parsed_frames if frame["can_id"] == HORN_STOP_ID]
+        stop_events = [
+            frame for frame in parsed_frames
+            if frame["can_id"] == stop_id
+        ]
 
-    pairs: list[dict[str, Any]] = []
-    unused_stops = stop_events.copy()
+        pairs: list[dict[str, Any]] = []
+        unused_stops = stop_events.copy()
 
-    for start in start_events:
-        matching_stop = None
-        for stop in unused_stops:
-            if stop["timestamp"] >= start["timestamp"]:
-                matching_stop = stop
-                break
+        for start in start_events:
+            matching_stop = None
 
-        if matching_stop is not None:
-            unused_stops.remove(matching_stop)
-            pairs.append(
+            for stop in unused_stops:
+                if stop["timestamp"] >= start["timestamp"]:
+                    matching_stop = stop
+                    break
+
+            if matching_stop is not None:
+                unused_stops.remove(matching_stop)
+                pairs.append(
+                    {
+                        "start_timestamp": start["timestamp"],
+                        "stop_timestamp": matching_stop["timestamp"],
+                        "duration_seconds": round(
+                            matching_stop["timestamp"] - start["timestamp"],
+                            6,
+                        ),
+                        "start_line": start["raw"],
+                        "stop_line": matching_stop["raw"],
+                    }
+                )
+
+        return {
+            "start_id": f"0x{start_id:08X}",
+            "stop_id": f"0x{stop_id:08X}",
+            "start_count": len(start_events),
+            "stop_count": len(stop_events),
+            "pair_count": len(pairs),
+            "start_events": [
                 {
-                    "start_timestamp": start["timestamp"],
-                    "stop_timestamp": matching_stop["timestamp"],
-                    "duration_seconds": round(
-                        matching_stop["timestamp"] - start["timestamp"],
-                        6,
-                    ),
-                    "start_line": start["raw"],
-                    "stop_line": matching_stop["raw"],
+                    "timestamp": frame["timestamp"],
+                    "raw": frame["raw"],
                 }
-            )
+                for frame in start_events
+            ],
+            "stop_events": [
+                {
+                    "timestamp": frame["timestamp"],
+                    "raw": frame["raw"],
+                }
+                for frame in stop_events
+            ],
+            "pairs": pairs,
+        }
 
-    if pairs:
+    joystick_evidence = find_events(
+        HORN_START_ID,
+        HORN_STOP_ID,
+    )
+
+    programmer_evidence = find_events(
+        PROGRAMMER_HORN_START_ID,
+        PROGRAMMER_HORN_STOP_ID,
+    )
+
+    joystick_pair_count = joystick_evidence["pair_count"]
+    programmer_pair_count = programmer_evidence["pair_count"]
+
+    joystick_partial = (
+        joystick_evidence["start_count"] > 0
+        or joystick_evidence["stop_count"] > 0
+    )
+
+    programmer_partial = (
+        programmer_evidence["start_count"] > 0
+        or programmer_evidence["stop_count"] > 0
+    )
+
+    if joystick_pair_count and programmer_pair_count:
         recognition_status = "confirmed"
+        horn_trigger_source = "both"
         summary = (
-            f"Found {len(pairs)} horn start/stop pair(s): "
+            f"Found joystick horn evidence "
+            f"({joystick_pair_count} start/stop pair(s)) and "
+            f"programmer horn evidence "
+            f"({programmer_pair_count} start/stop pair(s))."
+        )
+    elif joystick_pair_count:
+        recognition_status = "confirmed"
+        horn_trigger_source = "joystick"
+        summary = (
+            f"Found {joystick_pair_count} joystick horn start/stop pair(s): "
             f"0x{HORN_START_ID:08X} -> 0x{HORN_STOP_ID:08X}."
         )
-    elif start_events or stop_events:
+    elif programmer_pair_count:
+        recognition_status = "confirmed"
+        horn_trigger_source = "programmer"
+        summary = (
+            f"Found {programmer_pair_count} programmer horn start/stop pair(s): "
+            f"0x{PROGRAMMER_HORN_START_ID:08X} -> "
+            f"0x{PROGRAMMER_HORN_STOP_ID:08X}."
+        )
+    elif joystick_partial or programmer_partial:
         recognition_status = "candidate"
+
+        partial_sources = []
+
+        if joystick_partial:
+            partial_sources.append(
+                f"joystick start={joystick_evidence['start_count']}, "
+                f"stop={joystick_evidence['stop_count']}"
+            )
+
+        if programmer_partial:
+            partial_sources.append(
+                f"programmer start={programmer_evidence['start_count']}, "
+                f"stop={programmer_evidence['stop_count']}"
+            )
+
+        horn_trigger_source = "partial"
         summary = (
             "Found partial horn evidence: "
-            f"{len(start_events)} start frame(s), "
-            f"{len(stop_events)} stop frame(s)."
+            + "; ".join(partial_sources)
+            + "."
         )
     else:
         recognition_status = "not_observed"
-        summary = "No horn start/stop frames observed."
+        horn_trigger_source = None
+        summary = "No joystick or programmer horn start/stop frames observed."
 
     return {
         "recognizer": "horn_start_stop",
         "implemented": True,
         "status": recognition_status,
         "summary": summary,
-        "expected_start_id": f"0x{HORN_START_ID:08X}",
-        "expected_stop_id": f"0x{HORN_STOP_ID:08X}",
+        "horn_trigger_source": horn_trigger_source,
+
+        "expected_joystick_start_id": f"0x{HORN_START_ID:08X}",
+        "expected_joystick_stop_id": f"0x{HORN_STOP_ID:08X}",
+        "expected_programmer_start_id": f"0x{PROGRAMMER_HORN_START_ID:08X}",
+        "expected_programmer_stop_id": f"0x{PROGRAMMER_HORN_STOP_ID:08X}",
+
         "line_count": len(lines),
         "parsed_frame_count": len(parsed_frames),
-        "start_count": len(start_events),
-        "stop_count": len(stop_events),
-        "pair_count": len(pairs),
-        "pairs": pairs,
-    }
 
+        "joystick_evidence": joystick_evidence,
+        "programmer_evidence": programmer_evidence,
+    }
 
 def recognize_hazard_lights(lines: list[str]) -> dict[str, Any]:
     """
