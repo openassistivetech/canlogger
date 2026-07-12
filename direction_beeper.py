@@ -582,7 +582,7 @@ def main() -> None:
         bus = None
     else:
         try:
-            bus = can.interface.Bus(channel=args.interface, bustype=args.bustype)
+            bus = can.interface.Bus(channel=args.interface, interface=args.bustype)
         except OSError as exc:
             sys.stderr.write(f"Could not open {args.interface}: {exc}\n")
             sys.exit(1)
