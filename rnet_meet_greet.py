@@ -58,6 +58,7 @@ StepStatus = Literal["not_run", "skipped", "timeout", "candidate", "confirmed", 
 LOG_SNIPPET_ROOT_DEFAULT = "meet_greet_log_snippets"
 LISTEN_SECONDS_DEFAULT = 10.0
 MEET_GREET_FILES_ROOT_DEFAULT = "meet_greet_files"
+JOYSTICK_DEADZONE_DEFAULT = 3
 
 # Known R-Net frame IDs
 HORN_START_ID = 0x0C040100
@@ -171,6 +172,12 @@ def parse_can_log_line(line: str) -> dict[str, Any] | None:
         "raw": line.rstrip("\n"),
     }
 
+def signed_int8(value: int) -> int:
+    """Interpret one byte as signed int8."""
+    if value >= 128:
+        return value - 256
+    return value
+
 def looks_like_rnet_joystick_family(can_id: int) -> bool:
     """
     Heuristic for R-Net joystick-like 29-bit IDs.
@@ -183,6 +190,245 @@ def looks_like_rnet_joystick_family(can_id: int) -> bool:
     It looks for the broader 0x0200NN00 shape.
     """
     return (can_id & 0xFFFF00FF) == 0x02000000
+
+def joystick_state_from_xy(
+    x: int,
+    y: int,
+    *,
+    center_x: int,
+    center_y: int,
+    deadzone: int,
+) -> str:
+    dx = x - center_x
+    dy = y - center_y
+
+    if abs(dx) <= deadzone and abs(dy) <= deadzone:
+        return "center"
+
+    if abs(dx) >= abs(dy):
+        return "x_pos" if dx > 0 else "x_neg"
+
+    return "y_pos" if dy > 0 else "y_neg"
+
+
+def state_axis_and_sign(state: str) -> tuple[str | None, int | None]:
+    if state == "x_pos":
+        return "x", 1
+    if state == "x_neg":
+        return "x", -1
+    if state == "y_pos":
+        return "y", 1
+    if state == "y_neg":
+        return "y", -1
+    return None, None
+
+
+def states_are_opposites(a: str, b: str) -> bool:
+    axis_a, sign_a = state_axis_and_sign(a)
+    axis_b, sign_b = state_axis_and_sign(b)
+
+    return (
+        axis_a is not None
+        and axis_a == axis_b
+        and sign_a is not None
+        and sign_b is not None
+        and sign_a == -sign_b
+    )
+
+def extract_two_byte_xy_samples(lines: list[str]) -> list[dict[str, Any]]:
+    """
+    Extract all two-byte CAN frames as possible X/Y joystick samples.
+
+    This does not assume the CAN ID yet.
+    """
+    samples: list[dict[str, Any]] = []
+
+    for line in lines:
+        frame = parse_can_log_line(line)
+        if frame is None:
+            continue
+
+        data = data_hex_to_bytes(frame["data_hex"])
+        if len(data) != 2:
+            continue
+
+        x = signed_int8(data[0])
+        y = signed_int8(data[1])
+
+        samples.append(
+            {
+                "timestamp": frame["timestamp"],
+                "can_id": frame["can_id"],
+                "can_id_hex": frame["can_id_hex"],
+                "x": x,
+                "y": y,
+                "raw": frame["raw"],
+            }
+        )
+
+    return samples
+
+def sample_is_centered(
+    sample: dict[str, Any],
+    *,
+    center_x: int,
+    center_y: int,
+    deadzone: int,
+) -> bool:
+    dx = sample["x"] - center_x
+    dy = sample["y"] - center_y
+    return abs(dx) <= deadzone and abs(dy) <= deadzone
+
+def compress_joystick_motion_phases(
+    samples: list[dict[str, Any]],
+    *,
+    center_x: int,
+    center_y: int,
+    deadzone: int,
+    min_phase_samples: int = 2,
+) -> list[dict[str, Any]]:
+    """
+    Compress joystick samples into center/movement phases.
+
+    This is tolerant of:
+      - joystick ramping up through intermediate values
+      - joystick returning through intermediate values
+      - small off-axis noise during movement
+
+    Example:
+      0 -> y1 -> y2 -> y3 -> y2 -> y1 -> 0
+
+    becomes one movement phase whose dominant state is y_pos.
+    """
+    if not samples:
+        return []
+
+    ordered = sorted(samples, key=lambda sample: sample["timestamp"])
+
+    phases: list[dict[str, Any]] = []
+    current_kind: str | None = None
+    current_samples: list[dict[str, Any]] = []
+
+    def classify_phase(
+        phase_samples: list[dict[str, Any]],
+        kind: str,
+    ) -> dict[str, Any] | None:
+        if len(phase_samples) < min_phase_samples:
+            return None
+
+        xs = [sample["x"] for sample in phase_samples]
+        ys = [sample["y"] for sample in phase_samples]
+
+        dx_values = [x - center_x for x in xs]
+        dy_values = [y - center_y for y in ys]
+
+        max_abs_dx = max(abs(value) for value in dx_values)
+        max_abs_dy = max(abs(value) for value in dy_values)
+
+        if kind == "center":
+            return {
+                "kind": "center",
+                "state": "center",
+                "axis": None,
+                "sign": None,
+                "signed_peak": 0,
+                "max_abs_dx": max_abs_dx,
+                "max_abs_dy": max_abs_dy,
+                "dominance_ratio": None,
+                "sample_count": len(phase_samples),
+                "start_timestamp": phase_samples[0]["timestamp"],
+                "end_timestamp": phase_samples[-1]["timestamp"],
+                "duration_seconds": round(
+                    phase_samples[-1]["timestamp"] - phase_samples[0]["timestamp"],
+                    6,
+                ),
+                "x_min": min(xs),
+                "x_max": max(xs),
+                "y_min": min(ys),
+                "y_max": max(ys),
+                "example_lines": [
+                    sample["raw"] for sample in phase_samples[:3]
+                ],
+            }
+
+        # For a movement phase, choose the dominant axis over the whole phase,
+        # not sample-by-sample.
+        if max_abs_dx >= max_abs_dy:
+            axis = "x"
+            signed_peak = max(dx_values, key=lambda value: abs(value))
+        else:
+            axis = "y"
+            signed_peak = max(dy_values, key=lambda value: abs(value))
+
+        sign = 1 if signed_peak > 0 else -1
+        state = f"{axis}_{'pos' if sign > 0 else 'neg'}"
+
+        smaller_peak = min(max_abs_dx, max_abs_dy)
+        larger_peak = max(max_abs_dx, max_abs_dy)
+        dominance_ratio = (
+            round(larger_peak / smaller_peak, 3)
+            if smaller_peak > 0
+            else None
+        )
+
+        return {
+            "kind": "movement",
+            "state": state,
+            "axis": axis,
+            "sign": sign,
+            "signed_peak": signed_peak,
+            "max_abs_dx": max_abs_dx,
+            "max_abs_dy": max_abs_dy,
+            "dominance_ratio": dominance_ratio,
+            "sample_count": len(phase_samples),
+            "start_timestamp": phase_samples[0]["timestamp"],
+            "end_timestamp": phase_samples[-1]["timestamp"],
+            "duration_seconds": round(
+                phase_samples[-1]["timestamp"] - phase_samples[0]["timestamp"],
+                6,
+            ),
+            "x_min": min(xs),
+            "x_max": max(xs),
+            "y_min": min(ys),
+            "y_max": max(ys),
+            "example_lines": [
+                sample["raw"] for sample in phase_samples[:3]
+            ],
+        }
+
+    def flush_phase() -> None:
+        if not current_samples or current_kind is None:
+            return
+
+        phase = classify_phase(current_samples, current_kind)
+        if phase is not None:
+            phases.append(phase)
+
+    for sample in ordered:
+        centered = sample_is_centered(
+            sample,
+            center_x=center_x,
+            center_y=center_y,
+            deadzone=deadzone,
+        )
+        kind = "center" if centered else "movement"
+
+        if current_kind is None:
+            current_kind = kind
+            current_samples = [sample]
+            continue
+
+        if kind == current_kind:
+            current_samples.append(sample)
+            continue
+
+        flush_phase()
+        current_kind = kind
+        current_samples = [sample]
+
+    flush_phase()
+
+    return phases
 
 # -----------------------------------------------------------------------------
 # Future expectation / recognition stubs
@@ -1030,6 +1276,267 @@ def recognize_baseline_idle(lines: list[str]) -> dict[str, Any]:
         "joystick_idle_inference": joystick_idle_inference,
     }
 
+def recognize_joystick_calibration(
+    lines: list[str],
+    *,
+    deadzone: int = JOYSTICK_DEADZONE_DEFAULT,
+) -> dict[str, Any]:
+    """
+    Recognize joystick ID, center, axes, and polarity from a guided pattern.
+
+    Expected user pattern:
+      center -> forward -> center -> reverse -> center -> left -> center -> right -> center
+
+    The recognizer uses the order of movement phases to infer:
+      movement phase 1 = forward
+      movement phase 2 = reverse
+      movement phase 3 = left
+      movement phase 4 = right
+    """
+    samples = extract_two_byte_xy_samples(lines)
+
+    if not samples:
+        return {
+            "recognizer": "joystick_calibration",
+            "implemented": True,
+            "status": "timeout",
+            "summary": "No two-byte CAN frames found for joystick calibration.",
+            "line_count": len(lines),
+            "sample_count": 0,
+            "ranked_candidates": [],
+            "best_candidate": None,
+        }
+
+    samples_by_id: dict[int, list[dict[str, Any]]] = {}
+    for sample in samples:
+        samples_by_id.setdefault(sample["can_id"], []).append(sample)
+
+    ranked_candidates: list[dict[str, Any]] = []
+
+    for can_id, id_samples in samples_by_id.items():
+        if len(id_samples) < 5:
+            continue
+
+        pair_counts = Counter((sample["x"], sample["y"]) for sample in id_samples)
+        center_pair, center_count = pair_counts.most_common(1)[0]
+        center_x, center_y = center_pair
+        center_fraction = center_count / len(id_samples)
+
+        xs = [sample["x"] for sample in id_samples]
+        ys = [sample["y"] for sample in id_samples]
+
+        phases = compress_joystick_motion_phases(
+            id_samples,
+            center_x=center_x,
+            center_y=center_y,
+            deadzone=deadzone,
+        )
+
+        movement_phases = [
+            phase for phase in phases
+            if phase["kind"] == "movement"
+        ]
+
+        movement_states = [
+            phase["state"] for phase in movement_phases
+        ]
+
+        unique_movement_states = sorted(set(movement_states))
+
+        pattern_confirmed = False
+        inferred_mapping: dict[str, Any] | None = None
+        pattern_notes: list[str] = []
+
+        if len(movement_phases) >= 4:
+            forward_phase = movement_phases[0]
+            reverse_phase = movement_phases[1]
+            left_phase = movement_phases[2]
+            right_phase = movement_phases[3]
+
+            forward_state = forward_phase["state"]
+            reverse_state = reverse_phase["state"]
+            left_state = left_phase["state"]
+            right_state = right_phase["state"]
+
+            forward_axis, forward_sign = state_axis_and_sign(forward_state)
+            reverse_axis, reverse_sign = state_axis_and_sign(reverse_state)
+            left_axis, left_sign = state_axis_and_sign(left_state)
+            right_axis, right_sign = state_axis_and_sign(right_state)
+
+            forward_reverse_opposed = states_are_opposites(
+                forward_state,
+                reverse_state,
+            )
+            left_right_opposed = states_are_opposites(
+                left_state,
+                right_state,
+            )
+            axes_different = (
+                forward_axis is not None
+                and left_axis is not None
+                and forward_axis != left_axis
+            )
+
+            pattern_confirmed = (
+                forward_reverse_opposed
+                and left_right_opposed
+                and axes_different
+            )
+
+            inferred_mapping = {
+                "forward": {
+                    "state": forward_state,
+                    "axis": forward_axis,
+                    "sign": forward_sign,
+                    "phase": forward_phase,
+                },
+                "reverse": {
+                    "state": reverse_state,
+                    "axis": reverse_axis,
+                    "sign": reverse_sign,
+                    "phase": reverse_phase,
+                },
+                "left": {
+                    "state": left_state,
+                    "axis": left_axis,
+                    "sign": left_sign,
+                    "phase": left_phase,
+                },
+                "right": {
+                    "state": right_state,
+                    "axis": right_axis,
+                    "sign": right_sign,
+                    "phase": right_phase,
+                },
+                "forward_reverse_opposed": forward_reverse_opposed,
+                "left_right_opposed": left_right_opposed,
+                "axes_different": axes_different,
+            }
+
+            if not forward_reverse_opposed:
+                pattern_notes.append("First two movement phases were not opposites.")
+            if not left_right_opposed:
+                pattern_notes.append("Third and fourth movement phases were not opposites.")
+            if not axes_different:
+                pattern_notes.append("Forward/reverse axis and left/right axis were not clearly different.")
+        else:
+            pattern_notes.append(
+                f"Only found {len(movement_phases)} movement phase(s); expected at least 4."
+            )
+
+        timestamps = [sample["timestamp"] for sample in id_samples]
+        duration_seconds = max(0.0, max(timestamps) - min(timestamps))
+        rate_hz = (
+            len(id_samples) / duration_seconds
+            if duration_seconds > 0
+            else None
+        )
+
+        rnet_family = looks_like_rnet_joystick_family(can_id)
+        channel_byte = (can_id >> 8) & 0xFF
+
+        x_range = max(xs) - min(xs)
+        y_range = max(ys) - min(ys)
+
+        score = 0.0
+
+        if rnet_family:
+            score += 60.0
+            score += max(0.0, 32.0 - float(channel_byte))
+
+        if pattern_confirmed:
+            score += 200.0
+        else:
+            score += len(unique_movement_states) * 25.0
+
+        score += min(float(x_range + y_range) * 2.0, 80.0)
+        score += min(float(len(id_samples)) / 5.0, 40.0)
+        score += center_fraction * 30.0
+
+        if rate_hz is not None and rate_hz >= 10:
+            score += 20.0
+
+        ranked_candidates.append(
+            {
+                "can_id": f"0x{can_id:08X}",
+                "can_id_int": can_id,
+                "score": round(score, 3),
+                "rnet_joystick_family": rnet_family,
+                "channel_byte": f"0x{channel_byte:02X}",
+                "sample_count": len(id_samples),
+                "rate_hz": round(rate_hz, 3) if rate_hz is not None else None,
+                "center": {
+                    "x": center_x,
+                    "y": center_y,
+                    "sample_count": center_count,
+                    "fraction": round(center_fraction, 3),
+                },
+                "x_min": min(xs),
+                "x_max": max(xs),
+                "x_range": x_range,
+                "y_min": min(ys),
+                "y_max": max(ys),
+                "y_range": y_range,
+                "movement_states": movement_states,
+                "unique_movement_states": unique_movement_states,
+                "pattern_confirmed": pattern_confirmed,
+                "pattern_notes": pattern_notes,
+                "inferred_mapping": inferred_mapping,
+                "phases": phases[:20],
+            }
+        )
+
+    ranked_candidates.sort(
+        key=lambda candidate: candidate["score"],
+        reverse=True,
+    )
+
+    if not ranked_candidates:
+        return {
+            "recognizer": "joystick_calibration",
+            "implemented": True,
+            "status": "not_observed",
+            "summary": "No usable joystick calibration candidates found.",
+            "line_count": len(lines),
+            "sample_count": len(samples),
+            "ranked_candidates": [],
+            "best_candidate": None,
+        }
+
+    best = ranked_candidates[0]
+
+    if best["pattern_confirmed"]:
+        recognition_status = "confirmed"
+        summary = (
+            f"Confirmed joystick candidate {best['can_id']}. "
+            f"Center appears to be X={best['center']['x']}, Y={best['center']['y']}. "
+            "Movement pattern identified forward/reverse and left/right axes."
+        )
+    elif len(best["unique_movement_states"]) >= 2:
+        recognition_status = "candidate"
+        summary = (
+            f"Found joystick-like movement candidate {best['can_id']}, "
+            "but the full forward/reverse/left/right pattern was not clearly confirmed."
+        )
+    else:
+        recognition_status = "not_observed"
+        summary = (
+            "No clear joystick movement pattern observed. "
+            f"Best candidate was {best['can_id']}."
+        )
+
+    return {
+        "recognizer": "joystick_calibration",
+        "implemented": True,
+        "status": recognition_status,
+        "summary": summary,
+        "line_count": len(lines),
+        "sample_count": len(samples),
+        "deadzone": deadzone,
+        "best_candidate": best,
+        "ranked_candidates": ranked_candidates[:12],
+    }
+
 def recognize_step(step_key: str, lines: list[str]) -> dict[str, Any]:
     """
     Dispatch step-specific recognition.
@@ -1054,6 +1561,9 @@ def recognize_step(step_key: str, lines: list[str]) -> dict[str, Any]:
     
     if step_key == "flood_headlight":
         return recognize_flood_headlight(lines)
+
+    if step_key == "joystick_calibration":
+        return recognize_joystick_calibration(lines)
 
     return {
         "recognizer": None,
@@ -1527,8 +2037,8 @@ def build_default_steps() -> list[WizardStep]:
             key="baseline_idle",
             title="1. Baseline: chair idle",
             prompt=(
-                "Leave the joystick centered. Do not press buttons. The future version "
-                "will learn the normal idle bus chatter here."
+                "Leave the joystick centered. Do not press any buttons. We will learn the "
+                "normal idle bus chatter here."
             ),
             timeout_seconds=10.0,
         ),
@@ -1536,8 +2046,7 @@ def build_default_steps() -> list[WizardStep]:
             key="horn",
             title="2. Horn",
             prompt=(
-                "When listening starts, honk the horn once, then release. The future "
-                "version will look for horn start/stop candidates."
+                "When listening starts, honk the horn once, then release. We will look for horn start/stop candidates."
             ),
             timeout_seconds=6.0,
         ),
@@ -1578,13 +2087,23 @@ def build_default_steps() -> list[WizardStep]:
             timeout_seconds=8.0,
         ),
         WizardStep(
-            key="joystick_center",
-            title="7. Joystick center",
+            key="joystick_calibration",
+            title="7. Joystick ID / center / axes",
             prompt=(
-                "Keep the joystick centered. The future version will identify center "
-                "values and candidate joystick frames."
+                "When listening starts, move the joystick through this pattern slowly:\n"
+                "  1. center / hands off\n"
+                "  2. forward\n"
+                "  3. center\n"
+                "  4. reverse\n"
+                "  5. center\n"
+                "  6. left\n"
+                "  7. center\n"
+                "  8. right\n"
+                "  9. center\n\n"
+                "Hold each position briefly and return to center between directions. "
+                "The recognizer will use this to infer joystick ID, center, axes, and polarity."
             ),
-            timeout_seconds=5.0,
+            timeout_seconds=18.0,
         ),
         WizardStep(
             key="joystick_forward",
