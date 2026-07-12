@@ -558,6 +558,87 @@ def summarize_data_values(frames: list[dict[str, Any]], limit: int = 8) -> dict[
         ],
     }
 
+def parse_can_id_value(value: Any) -> int | None:
+    if value is None:
+        return None
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, str):
+        try:
+            return int(value, 16)
+        except ValueError:
+            return None
+
+    return None
+
+
+def get_confirmed_joystick_can_id(profile: MeetGreetProfile) -> int | None:
+    """
+    Return the joystick CAN ID confirmed earlier in the wizard, if available.
+    """
+    value = profile.confirmed.get("joystick_can_id_int")
+    parsed = parse_can_id_value(value)
+
+    if parsed is not None:
+        return parsed
+
+    value = profile.confirmed.get("joystick_can_id")
+    parsed = parse_can_id_value(value)
+
+    if parsed is not None:
+        return parsed
+
+    calibration_result = profile.steps.get("joystick_calibration")
+    if calibration_result is None:
+        return None
+
+    recognition = calibration_result.observations.get("recognition", {})
+    if recognition.get("status") != "confirmed":
+        return None
+
+    best_candidate = recognition.get("best_candidate") or {}
+
+    return parse_can_id_value(
+        best_candidate.get("can_id_int")
+        or best_candidate.get("can_id")
+    )
+
+
+def update_profile_from_step_result(
+    profile: MeetGreetProfile,
+    result: StepResult,
+) -> None:
+    """
+    Promote important confirmed findings into profile.confirmed.
+
+    This is what lets later steps remember that joystick_calibration already
+    found the joystick command ID.
+    """
+    recognition = result.observations.get("recognition", {})
+
+    if result.key != "joystick_calibration":
+        return
+
+    if recognition.get("status") != "confirmed":
+        return
+
+    best_candidate = recognition.get("best_candidate") or {}
+
+    joystick_can_id_int = parse_can_id_value(
+        best_candidate.get("can_id_int")
+        or best_candidate.get("can_id")
+    )
+
+    if joystick_can_id_int is None:
+        return
+
+    profile.confirmed["joystick_can_id"] = f"0x{joystick_can_id_int:08X}"
+    profile.confirmed["joystick_can_id_int"] = joystick_can_id_int
+    profile.confirmed["joystick_center"] = best_candidate.get("center")
+    profile.confirmed["joystick_mapping"] = best_candidate.get("inferred_mapping")
+
 # -----------------------------------------------------------------------------
 # Future expectation / recognition stubs
 # -----------------------------------------------------------------------------
@@ -1692,6 +1773,7 @@ def recognize_joystick_single_direction(
     *,
     direction_name: str,
     deadzone: int = JOYSTICK_DEADZONE_DEFAULT,
+    known_joystick_can_id: int | None = None,
 ) -> dict[str, Any]:
     """
     Recognize one independently prompted joystick push.
@@ -1725,9 +1807,23 @@ def recognize_joystick_single_direction(
     for sample in samples:
         samples_by_id.setdefault(sample["can_id"], []).append(sample)
 
+    used_known_joystick_id = False
+    known_joystick_missing = False
+
+    if known_joystick_can_id is not None:
+        if known_joystick_can_id in samples_by_id:
+            candidate_can_ids = [known_joystick_can_id]
+            used_known_joystick_id = True
+        else:
+            candidate_can_ids = sorted(samples_by_id.keys())
+            known_joystick_missing = True
+    else:
+        candidate_can_ids = sorted(samples_by_id.keys())
+
     ranked_candidates: list[dict[str, Any]] = []
 
-    for can_id, id_samples in samples_by_id.items():
+    for can_id in candidate_can_ids:
+        id_samples = samples_by_id[can_id]
         if len(id_samples) < 5:
             continue
 
@@ -1842,6 +1938,13 @@ def recognize_joystick_single_direction(
                 "direction_range": direction_range,
                 "drive_response_candidates": drive_response_candidates,
                 "phases": phases[:20],
+                "used_known_joystick_id": used_known_joystick_id,
+                "known_joystick_missing": known_joystick_missing,
+                "known_joystick_can_id": (
+                    f"0x{known_joystick_can_id:08X}"
+                    if known_joystick_can_id is not None
+                    else None
+                ),
             }
         )
 
@@ -1905,28 +2008,48 @@ def recognize_joystick_single_direction(
         "ranked_candidates": ranked_candidates[:12],
     }
 
-def recognize_joystick_forward(lines: list[str]) -> dict[str, Any]:
+def recognize_joystick_forward(
+    lines: list[str],
+    *,
+    known_joystick_can_id: int | None = None,
+) -> dict[str, Any]:
     return recognize_joystick_single_direction(
         lines,
         direction_name="forward",
+        known_joystick_can_id=known_joystick_can_id,
     )
 
-def recognize_joystick_reverse(lines: list[str]) -> dict[str, Any]:
+def recognize_joystick_reverse(
+    lines: list[str],
+    *,
+    known_joystick_can_id: int | None = None,
+) -> dict[str, Any]:
     return recognize_joystick_single_direction(
         lines,
         direction_name="reverse",
+        known_joystick_can_id=known_joystick_can_id,
     )
 
-def recognize_joystick_left(lines: list[str]) -> dict[str, Any]:
+def recognize_joystick_left(
+    lines: list[str],
+    *,
+    known_joystick_can_id: int | None = None,
+) -> dict[str, Any]:
     return recognize_joystick_single_direction(
         lines,
         direction_name="left",
+        known_joystick_can_id=known_joystick_can_id,
     )
 
-def recognize_joystick_right(lines: list[str]) -> dict[str, Any]:
+def recognize_joystick_right(
+    lines: list[str],
+    *,
+    known_joystick_can_id: int | None = None,
+) -> dict[str, Any]:
     return recognize_joystick_single_direction(
         lines,
         direction_name="right",
+        known_joystick_can_id=known_joystick_can_id,
     )
 
 def recognize_drive_response_candidates(
@@ -1936,6 +2059,7 @@ def recognize_drive_response_candidates(
     joystick_can_id: int | None,
     source_step: str,
     max_candidates: int = 12,
+    exclude_rnet_joystick_family: bool = True,
 ) -> dict[str, Any]:
     """
     Rank non-joystick CAN IDs that appear to respond during joystick movement.
@@ -1991,10 +2115,12 @@ def recognize_drive_response_candidates(
     for frame in parsed_frames:
         can_id = frame["can_id"]
 
-        # Do not rank the joystick command frame as a motor/controller response.
+        # Do not rank joystick command/status-family frames as motor/controller response.
         if joystick_can_id is not None and can_id == joystick_can_id:
             continue
 
+        if exclude_rnet_joystick_family and looks_like_rnet_joystick_family(can_id):
+            continue
         frames_by_id.setdefault(can_id, []).append(frame)
 
     candidates: list[dict[str, Any]] = []
@@ -2210,7 +2336,12 @@ def summarize_top_drive_response_candidates(
 
     return note
 
-def recognize_step(step_key: str, lines: list[str]) -> dict[str, Any]:
+def recognize_step(
+    step_key: str,
+    lines: list[str],
+    *,
+    known_joystick_can_id: int | None = None,
+) -> dict[str, Any]:
     """
     Dispatch step-specific recognition.
 
@@ -2239,17 +2370,29 @@ def recognize_step(step_key: str, lines: list[str]) -> dict[str, Any]:
         return recognize_joystick_calibration(lines)
     
     if step_key == "joystick_forward":
-        return recognize_joystick_forward(lines)
+        return recognize_joystick_forward(
+            lines,
+            known_joystick_can_id=known_joystick_can_id,
+        )
 
     if step_key == "joystick_reverse":
-        return recognize_joystick_reverse(lines)
+        return recognize_joystick_reverse(
+            lines,
+            known_joystick_can_id=known_joystick_can_id,
+        )
 
     if step_key == "joystick_left":
-        return recognize_joystick_left(lines)
+        return recognize_joystick_left(
+            lines,
+            known_joystick_can_id=known_joystick_can_id,
+        )
 
     if step_key == "joystick_right":
-        return recognize_joystick_right(lines)
-
+        return recognize_joystick_right(
+            lines,
+            known_joystick_can_id=known_joystick_can_id,
+        )
+    
     return {
         "recognizer": None,
         "implemented": False,
@@ -2516,6 +2659,7 @@ def run_step(
     *,
     replay_root: Path | None = None,
     replay_pick: str = "ask",
+    known_joystick_can_id: int | None = None,
 ) -> StepResult:
     if replay_root is not None:
         return run_replay_step(
@@ -2523,18 +2667,22 @@ def run_step(
             log_root,
             replay_root=replay_root,
             replay_pick=replay_pick,
+            known_joystick_can_id=known_joystick_can_id,
         )
 
     return run_live_step(
         step,
         log_root,
         listen_seconds,
+        known_joystick_can_id=known_joystick_can_id,
     )
 
 def run_live_step(
     step: WizardStep,
     log_root: Path,
     listen_seconds: float,
+    *,
+    known_joystick_can_id: int | None = None,
 ) -> StepResult:
     """Run one skippable wizard step with a timeout placeholder."""
     print("\n" + "=" * 78)
@@ -2575,7 +2723,11 @@ def run_live_step(
         seconds=listen_seconds,
     )
 
-    recognition = recognize_step(step.key, lines)
+    recognition = recognize_step(
+        step.key,
+        lines,
+        known_joystick_can_id=known_joystick_can_id,
+    )
     print_recognition_summary(recognition)
     
     label = ask_user_for_step_result()
@@ -2598,7 +2750,8 @@ def run_live_step(
         return run_live_step(
             step,
             log_root,
-            listen_seconds
+            listen_seconds,
+            known_joystick_can_id=known_joystick_can_id,
         )
     if label == "skipped":
         return StepResult(
@@ -2638,6 +2791,8 @@ def run_replay_step(
     log_root: Path,
     replay_root: Path | None = None,
     replay_pick: str = "ask",
+    *,
+    known_joystick_can_id: int | None = None,
 ) -> StepResult:
     """Run one step using an existing saved log snippet, not live chair actions."""
     print("\n" + "=" * 78)
@@ -2672,11 +2827,15 @@ def run_replay_step(
                 "source": "replay",
                 "replay_source": None,
                 "line_count": 0,
-                "recognition": recognition,
+                "recognition": None,
             },
         )
 
-    recognition = recognize_step(step.key, lines)
+    recognition = recognize_step(
+        step.key,
+        lines,
+        known_joystick_can_id=known_joystick_can_id,
+    )
     print_recognition_summary(recognition)
     
     notes = (
@@ -2834,18 +2993,6 @@ def build_default_steps() -> list[WizardStep]:
             timeout_seconds=8.0,
             safety_note=drive_safety,
         ),
-        WizardStep(
-            key="motor_current",
-            title="12. Motor current / motion gate",
-            prompt=(
-                "When listening starts, perform one small gentle drive movement "
-                "and return to center. The future version will look for motor "
-                "current or motion-state candidates."
-            ),
-            timeout_seconds=8.0,
-            safety_note=drive_safety,
-        ), 
-    
     ]
 
     return steps
@@ -2963,14 +3110,20 @@ def main() -> int:
 
     try:
         for step in steps:
+            known_joystick_can_id = get_confirmed_joystick_can_id(profile)
+
             result = run_step(
                 step,
                 log_root,
                 args.listen_seconds,
                 replay_root=replay_root,
                 replay_pick=args.replay_pick,
+                known_joystick_can_id=known_joystick_can_id,
             )
+
             profile.steps[result.key] = result
+            update_profile_from_step_result(profile, result)
+
             save_json_profile(profile, output_path)
     except KeyboardInterrupt:
         print("\nWizard interrupted. Saving partial placeholder profile...")
