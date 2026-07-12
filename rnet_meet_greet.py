@@ -61,6 +61,24 @@ MEET_GREET_FILES_ROOT_DEFAULT = "meet_greet_files"
 # Known R-Net frame IDs
 HORN_START_ID = 0x0C040100
 HORN_STOP_ID = 0x0C040101
+HAZARD_TOGGLE_ID = 0x0C000103
+LEFT_INDICATOR_TOGGLE_ID = 0x0C000101
+RIGHT_INDICATOR_TOGGLE_ID = 0x0C000102
+FLOOD_HEADLIGHT_TOGGLE_ID = 0x0C000104
+
+# Optional UI/status evidence (displays on the screen-enabled joysticks when the signals are flashing). 
+# Useful, but weaker than the physical toggle.
+LAMP_STATUS_ID = 0x0C000400
+LAMP_HAZARD = 0x10
+LAMP_LEFT = 0x01
+LAMP_RIGHT = 0x04
+LAMP_FLOOD_HEADLIGHT = 0x80
+
+# Optional programmer-diagnostics versions
+PROGRAMMER_HAZARD_TOGGLE_ID = 0x0C000F03
+PROGRAMMER_LEFT_INDICATOR_TOGGLE_ID = 0x0C000F01
+PROGRAMMER_RIGHT_INDICATOR_TOGGLE_ID = 0x0C000F02
+PROGRAMMER_FLOOD_HEADLIGHT_TOGGLE_ID = 0x0C000F04
 
 @dataclass
 class StepResult:
@@ -106,6 +124,12 @@ CAN_LOG_LINE_RE = re.compile(
     r"(?P<can_id>[0-9A-Fa-f]+)#(?P<data>[0-9A-Fa-f]*)"
 )
 
+def data_hex_to_bytes(data_hex: str) -> bytes:
+    """Safely decode CAN data hex into bytes."""
+    try:
+        return bytes.fromhex(data_hex)
+    except ValueError:
+        return b""
 
 def parse_can_log_line(line: str) -> dict[str, Any] | None:
     """
@@ -167,14 +191,6 @@ def parse_can_log_line(line: str) -> dict[str, Any] | None:
 
 # def rank_candidate_frames(baseline_frames: list, action_frames: list) -> list:
 #     """Future: find frames that appear/change during the action but not baseline."""
-#     pass
-
-# def recognize_horn_start_stop(baseline_frames: list, action_frames: list) -> dict:
-#     """Future: recognize horn start/stop frame candidates."""
-#     pass
-
-# def recognize_light_toggle(action_name: str, baseline_frames: list, action_frames: list) -> dict:
-#     """Future: recognize physical light toggle and UI/status bitmap candidates."""
 #     pass
 
 # def recognize_joystick_axis(action_name: str, baseline_frames: list, action_frames: list) -> dict:
@@ -284,18 +300,465 @@ def recognize_horn_start_stop(lines: list[str]) -> dict[str, Any]:
         "pairs": pairs,
     }
 
+def recognize_hazard_lights(lines: list[str]) -> dict[str, Any]:
+    """
+    Recognize hazard-light activity.
+
+    Strong evidence:
+      0C000103# appears when the physical hazard button/function is toggled.
+
+    Weaker/status evidence:
+      0C000400#maskbitmap may report/update lamp icon state.
+      For that bitmap:
+        bit 0x10 = hazard
+
+    Expected user action for this step:
+      toggle hazards ON, pause, toggle hazards OFF
+
+    So two hazard toggle events is a strong match.
+    """
+    parsed_frames: list[dict[str, Any]] = []
+
+    for line in lines:
+        frame = parse_can_log_line(line)
+        if frame is not None:
+            parsed_frames.append(frame)
+
+    physical_toggle_events = [
+        frame for frame in parsed_frames
+        if frame["can_id"] == HAZARD_TOGGLE_ID
+    ]
+
+    programmer_toggle_events = [
+        frame for frame in parsed_frames
+        if frame["can_id"] == PROGRAMMER_HAZARD_TOGGLE_ID
+    ] if "PROGRAMMER_HAZARD_TOGGLE_ID" in globals() else []
+
+    status_events: list[dict[str, Any]] = []
+
+    for frame in parsed_frames:
+        if frame["can_id"] != LAMP_STATUS_ID:
+            continue
+
+        data = data_hex_to_bytes(frame["data_hex"])
+        if len(data) < 2:
+            continue
+
+        mask = data[0]
+        bitmap = data[1]
+
+        # Only treat it as hazard-relevant if the hazard bit is included
+        # in the mask or shown as active in the bitmap.
+        if (mask & LAMP_HAZARD) or (bitmap & LAMP_HAZARD):
+            status_events.append(
+                {
+                    "timestamp": frame["timestamp"],
+                    "raw": frame["raw"],
+                    "mask": f"0x{mask:02X}",
+                    "bitmap": f"0x{bitmap:02X}",
+                    "hazard_masked": bool(mask & LAMP_HAZARD),
+                    "hazard_on": bool(bitmap & LAMP_HAZARD),
+                }
+            )
+
+    toggle_intervals: list[dict[str, Any]] = []
+    all_toggle_events = physical_toggle_events + programmer_toggle_events
+    all_toggle_events = sorted(all_toggle_events, key=lambda frame: frame["timestamp"])
+
+    for previous, current in zip(all_toggle_events, all_toggle_events[1:]):
+        toggle_intervals.append(
+            {
+                "from_timestamp": previous["timestamp"],
+                "to_timestamp": current["timestamp"],
+                "delta_seconds": round(current["timestamp"] - previous["timestamp"], 6),
+            }
+        )
+
+    physical_count = len(physical_toggle_events)
+    programmer_count = len(programmer_toggle_events)
+    total_toggle_count = len(all_toggle_events)
+
+    if physical_count >= 2:
+        recognition_status = "confirmed"
+        summary = (
+            f"Found {physical_count} physical hazard toggle frame(s) "
+            f"0x{HAZARD_TOGGLE_ID:08X}. This matches ON then OFF."
+        )
+    elif physical_count == 1:
+        recognition_status = "candidate"
+        summary = (
+            f"Found one physical hazard toggle frame 0x{HAZARD_TOGGLE_ID:08X}; "
+            "expected two for ON then OFF."
+        )
+    elif programmer_count >= 2:
+        recognition_status = "candidate"
+        summary = (
+            f"Found {programmer_count} programmer-diagnostic hazard event(s), "
+            "but no physical joystick-button hazard toggle frames."
+        )
+    elif status_events:
+        recognition_status = "candidate"
+        summary = (
+            "Found hazard-related lamp status/icon evidence, but no physical "
+            "hazard toggle command frame."
+        )
+    else:
+        recognition_status = "not_observed"
+        summary = "No hazard toggle or hazard-status evidence observed."
+
+    return {
+        "recognizer": "hazard_lights",
+        "implemented": True,
+        "status": recognition_status,
+        "summary": summary,
+        "expected_physical_toggle_id": f"0x{HAZARD_TOGGLE_ID:08X}",
+        "expected_status_id": f"0x{LAMP_STATUS_ID:08X}",
+        "hazard_status_bit": f"0x{LAMP_HAZARD:02X}",
+        "line_count": len(lines),
+        "parsed_frame_count": len(parsed_frames),
+        "physical_toggle_count": physical_count,
+        "programmer_toggle_count": programmer_count,
+        "total_toggle_count": total_toggle_count,
+        "status_event_count": len(status_events),
+        "physical_toggle_events": [
+            {
+                "timestamp": frame["timestamp"],
+                "raw": frame["raw"],
+            }
+            for frame in physical_toggle_events
+        ],
+        "programmer_toggle_events": [
+            {
+                "timestamp": frame["timestamp"],
+                "raw": frame["raw"],
+            }
+            for frame in programmer_toggle_events
+        ],
+        "toggle_intervals": toggle_intervals,
+        "status_events": status_events,
+    }
+
+def recognize_indicator_toggle(
+    lines: list[str],
+    *,
+    name: str,
+    physical_toggle_id: int,
+    status_bit: int,
+    programmer_toggle_id: int | None = None,
+) -> dict[str, Any]:
+    """
+    Recognize left/right indicator activity.
+
+    Strong evidence:
+      physical toggle frame appears, e.g.
+        left:  0C000101#
+        right: 0C000102#
+
+    Weaker/status evidence:
+      0C000400#maskbitmap may report/update lamp icon state.
+      This is useful but weaker than the physical toggle frame.
+    """
+    parsed_frames: list[dict[str, Any]] = []
+
+    for line in lines:
+        frame = parse_can_log_line(line)
+        if frame is not None:
+            parsed_frames.append(frame)
+
+    physical_toggle_events = [
+        frame for frame in parsed_frames
+        if frame["can_id"] == physical_toggle_id
+    ]
+
+    if programmer_toggle_id is not None:
+        programmer_toggle_events = [
+            frame for frame in parsed_frames
+            if frame["can_id"] == programmer_toggle_id
+        ]
+    else:
+        programmer_toggle_events = []
+
+    status_events: list[dict[str, Any]] = []
+
+    for frame in parsed_frames:
+        if frame["can_id"] != LAMP_STATUS_ID:
+            continue
+
+        data = data_hex_to_bytes(frame["data_hex"])
+        if len(data) < 2:
+            continue
+
+        mask = data[0]
+        bitmap = data[1]
+
+        if (mask & status_bit) or (bitmap & status_bit):
+            status_events.append(
+                {
+                    "timestamp": frame["timestamp"],
+                    "raw": frame["raw"],
+                    "mask": f"0x{mask:02X}",
+                    "bitmap": f"0x{bitmap:02X}",
+                    "status_bit_masked": bool(mask & status_bit),
+                    "indicator_on": bool(bitmap & status_bit),
+                }
+            )
+
+    all_toggle_events = sorted(
+        physical_toggle_events + programmer_toggle_events,
+        key=lambda frame: frame["timestamp"],
+    )
+
+    toggle_intervals: list[dict[str, Any]] = []
+    for previous, current in zip(all_toggle_events, all_toggle_events[1:]):
+        toggle_intervals.append(
+            {
+                "from_timestamp": previous["timestamp"],
+                "to_timestamp": current["timestamp"],
+                "delta_seconds": round(current["timestamp"] - previous["timestamp"], 6),
+            }
+        )
+
+    physical_count = len(physical_toggle_events)
+    programmer_count = len(programmer_toggle_events)
+    total_toggle_count = len(all_toggle_events)
+
+    if physical_count >= 2:
+        recognition_status = "confirmed"
+        summary = (
+            f"Found {physical_count} physical {name} indicator toggle frame(s) "
+            f"0x{physical_toggle_id:08X}. This matches ON then OFF."
+        )
+    elif physical_count == 1:
+        recognition_status = "candidate"
+        summary = (
+            f"Found one physical {name} indicator toggle frame "
+            f"0x{physical_toggle_id:08X}; expected two for ON then OFF."
+        )
+    elif programmer_count >= 2:
+        recognition_status = "candidate"
+        summary = (
+            f"Found {programmer_count} programmer-diagnostic {name} indicator event(s), "
+            f"but no physical joystick-button {name} toggle frames."
+        )
+    elif status_events:
+        recognition_status = "candidate"
+        summary = (
+            f"Found {name} indicator lamp status/icon evidence, but no physical "
+            f"{name} toggle command frame."
+        )
+    else:
+        recognition_status = "not_observed"
+        summary = f"No {name} indicator toggle or status evidence observed."
+
+    return {
+        "recognizer": f"{name}_indicator",
+        "implemented": True,
+        "status": recognition_status,
+        "summary": summary,
+        "expected_physical_toggle_id": f"0x{physical_toggle_id:08X}",
+        "expected_status_id": f"0x{LAMP_STATUS_ID:08X}",
+        "status_bit": f"0x{status_bit:02X}",
+        "line_count": len(lines),
+        "parsed_frame_count": len(parsed_frames),
+        "physical_toggle_count": physical_count,
+        "programmer_toggle_count": programmer_count,
+        "total_toggle_count": total_toggle_count,
+        "status_event_count": len(status_events),
+        "physical_toggle_events": [
+            {
+                "timestamp": frame["timestamp"],
+                "raw": frame["raw"],
+            }
+            for frame in physical_toggle_events
+        ],
+        "programmer_toggle_events": [
+            {
+                "timestamp": frame["timestamp"],
+                "raw": frame["raw"],
+            }
+            for frame in programmer_toggle_events
+        ],
+        "toggle_intervals": toggle_intervals,
+        "status_events": status_events,
+    }
+
+def recognize_left_indicator(lines: list[str]) -> dict[str, Any]:
+    return recognize_indicator_toggle(
+        lines,
+        name="left",
+        physical_toggle_id=LEFT_INDICATOR_TOGGLE_ID,
+        status_bit=LAMP_LEFT,
+        programmer_toggle_id=PROGRAMMER_LEFT_INDICATOR_TOGGLE_ID,
+    )
+
+
+def recognize_right_indicator(lines: list[str]) -> dict[str, Any]:
+    return recognize_indicator_toggle(
+        lines,
+        name="right",
+        physical_toggle_id=RIGHT_INDICATOR_TOGGLE_ID,
+        status_bit=LAMP_RIGHT,
+        programmer_toggle_id=PROGRAMMER_RIGHT_INDICATOR_TOGGLE_ID,
+    )
+
+def recognize_flood_headlight(lines: list[str]) -> dict[str, Any]:
+    """
+    Recognize flood/headlight activity.
+
+    Strong evidence:
+      0C000104# appears when the physical flood/headlight function is toggled.
+
+    Weaker/status evidence:
+      0C000400#maskbitmap may report/update lamp icon state.
+      For that bitmap:
+        bit 0x80 = flood/headlight
+
+    Expected user action for this step:
+      toggle flood/headlight ON, pause, toggle flood/headlight OFF
+
+    So two physical toggle events is a strong match.
+    """
+    parsed_frames: list[dict[str, Any]] = []
+
+    for line in lines:
+        frame = parse_can_log_line(line)
+        if frame is not None:
+            parsed_frames.append(frame)
+
+    physical_toggle_events = [
+        frame for frame in parsed_frames
+        if frame["can_id"] == FLOOD_HEADLIGHT_TOGGLE_ID
+    ]
+
+    programmer_toggle_events = [
+        frame for frame in parsed_frames
+        if frame["can_id"] == PROGRAMMER_FLOOD_HEADLIGHT_TOGGLE_ID
+    ]
+
+    status_events: list[dict[str, Any]] = []
+
+    for frame in parsed_frames:
+        if frame["can_id"] != LAMP_STATUS_ID:
+            continue
+
+        data = data_hex_to_bytes(frame["data_hex"])
+        if len(data) < 2:
+            continue
+
+        mask = data[0]
+        bitmap = data[1]
+
+        if (mask & LAMP_FLOOD_HEADLIGHT) or (bitmap & LAMP_FLOOD_HEADLIGHT):
+            status_events.append(
+                {
+                    "timestamp": frame["timestamp"],
+                    "raw": frame["raw"],
+                    "mask": f"0x{mask:02X}",
+                    "bitmap": f"0x{bitmap:02X}",
+                    "flood_headlight_masked": bool(mask & LAMP_FLOOD_HEADLIGHT),
+                    "flood_headlight_on": bool(bitmap & LAMP_FLOOD_HEADLIGHT),
+                }
+            )
+
+    all_toggle_events = sorted(
+        physical_toggle_events + programmer_toggle_events,
+        key=lambda frame: frame["timestamp"],
+    )
+
+    toggle_intervals: list[dict[str, Any]] = []
+    for previous, current in zip(all_toggle_events, all_toggle_events[1:]):
+        toggle_intervals.append(
+            {
+                "from_timestamp": previous["timestamp"],
+                "to_timestamp": current["timestamp"],
+                "delta_seconds": round(current["timestamp"] - previous["timestamp"], 6),
+            }
+        )
+
+    physical_count = len(physical_toggle_events)
+    programmer_count = len(programmer_toggle_events)
+    total_toggle_count = len(all_toggle_events)
+
+    if physical_count >= 2:
+        recognition_status = "confirmed"
+        summary = (
+            f"Found {physical_count} physical flood/headlight toggle frame(s) "
+            f"0x{FLOOD_HEADLIGHT_TOGGLE_ID:08X}. This matches ON then OFF."
+        )
+    elif physical_count == 1:
+        recognition_status = "candidate"
+        summary = (
+            f"Found one physical flood/headlight toggle frame "
+            f"0x{FLOOD_HEADLIGHT_TOGGLE_ID:08X}; expected two for ON then OFF."
+        )
+    elif programmer_count >= 2:
+        recognition_status = "candidate"
+        summary = (
+            f"Found {programmer_count} programmer-diagnostic flood/headlight event(s), "
+            "but no physical joystick-button flood/headlight toggle frames."
+        )
+    elif status_events:
+        recognition_status = "candidate"
+        summary = (
+            "Found flood/headlight lamp status/icon evidence, but no physical "
+            "flood/headlight toggle command frame."
+        )
+    else:
+        recognition_status = "not_observed"
+        summary = "No flood/headlight toggle or status evidence observed."
+
+    return {
+        "recognizer": "flood_headlight",
+        "implemented": True,
+        "status": recognition_status,
+        "summary": summary,
+        "expected_physical_toggle_id": f"0x{FLOOD_HEADLIGHT_TOGGLE_ID:08X}",
+        "expected_status_id": f"0x{LAMP_STATUS_ID:08X}",
+        "status_bit": f"0x{LAMP_FLOOD_HEADLIGHT:02X}",
+        "line_count": len(lines),
+        "parsed_frame_count": len(parsed_frames),
+        "physical_toggle_count": physical_count,
+        "programmer_toggle_count": programmer_count,
+        "total_toggle_count": total_toggle_count,
+        "status_event_count": len(status_events),
+        "physical_toggle_events": [
+            {
+                "timestamp": frame["timestamp"],
+                "raw": frame["raw"],
+            }
+            for frame in physical_toggle_events
+        ],
+        "programmer_toggle_events": [
+            {
+                "timestamp": frame["timestamp"],
+                "raw": frame["raw"],
+            }
+            for frame in programmer_toggle_events
+        ],
+        "toggle_intervals": toggle_intervals,
+        "status_events": status_events,
+    }
+
 def recognize_step(step_key: str, lines: list[str]) -> dict[str, Any]:
     """
     Dispatch step-specific recognition.
 
-    More recognizers will be added here later:
-      - lights
-      - joystick axes
-      - motor current
-      - seating
+    Keep adding recognizers for different step types here.
     """
     if step_key == "horn":
         return recognize_horn_start_stop(lines)
+
+    if step_key == "hazard":
+        return recognize_hazard_lights(lines)
+
+    if step_key == "left_indicator":
+        return recognize_left_indicator(lines)
+
+    if step_key == "right_indicator":
+        return recognize_right_indicator(lines)
+    
+    if step_key == "flood_headlight":
+        return recognize_flood_headlight(lines)
 
     return {
         "recognizer": None,
