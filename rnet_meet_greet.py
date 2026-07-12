@@ -430,6 +430,83 @@ def compress_joystick_motion_phases(
 
     return phases
 
+def summarize_single_direction_phase(
+    direction_name: str,
+    phase: dict[str, Any],
+    *,
+    center_x: int,
+    center_y: int,
+) -> dict[str, Any]:
+    """
+    Summarize one independently prompted joystick direction.
+
+    The direction_name comes from the wizard step:
+      forward, reverse, left, right
+
+    The axis/sign comes from the data.
+    """
+    dx_min = phase["x_min"] - center_x
+    dx_max = phase["x_max"] - center_x
+    dy_min = phase["y_min"] - center_y
+    dy_max = phase["y_max"] - center_y
+
+    axis = phase["axis"]
+    sign = phase["sign"]
+
+    if axis == "x":
+        primary_delta_min = dx_min
+        primary_delta_max = dx_max
+        primary_abs_peak = phase["max_abs_dx"]
+        off_axis = "y"
+        off_axis_abs_peak = phase["max_abs_dy"]
+    elif axis == "y":
+        primary_delta_min = dy_min
+        primary_delta_max = dy_max
+        primary_abs_peak = phase["max_abs_dy"]
+        off_axis = "x"
+        off_axis_abs_peak = phase["max_abs_dx"]
+    else:
+        primary_delta_min = None
+        primary_delta_max = None
+        primary_abs_peak = None
+        off_axis = None
+        off_axis_abs_peak = None
+
+    return {
+        "direction": direction_name,
+        "observed_state": phase["state"],
+        "axis": axis,
+        "sign": sign,
+        "signed_peak_from_center": phase["signed_peak"],
+
+        "primary_delta_min": primary_delta_min,
+        "primary_delta_max": primary_delta_max,
+        "primary_abs_peak": primary_abs_peak,
+
+        "off_axis": off_axis,
+        "off_axis_abs_peak": off_axis_abs_peak,
+        "dominance_ratio": phase["dominance_ratio"],
+
+        "center_x": center_x,
+        "center_y": center_y,
+
+        "x_min": phase["x_min"],
+        "x_max": phase["x_max"],
+        "y_min": phase["y_min"],
+        "y_max": phase["y_max"],
+
+        "dx_min": dx_min,
+        "dx_max": dx_max,
+        "dy_min": dy_min,
+        "dy_max": dy_max,
+
+        "sample_count": phase["sample_count"],
+        "duration_seconds": phase["duration_seconds"],
+        "start_timestamp": phase["start_timestamp"],
+        "end_timestamp": phase["end_timestamp"],
+        "example_lines": phase["example_lines"],
+    }
+
 # -----------------------------------------------------------------------------
 # Future expectation / recognition stubs
 # -----------------------------------------------------------------------------
@@ -1537,6 +1614,223 @@ def recognize_joystick_calibration(
         "ranked_candidates": ranked_candidates[:12],
     }
 
+def recognize_joystick_single_direction(
+    lines: list[str],
+    *,
+    direction_name: str,
+    deadzone: int = JOYSTICK_DEADZONE_DEFAULT,
+) -> dict[str, Any]:
+    """
+    Recognize one independently prompted joystick push.
+
+    The step tells us the intended direction:
+      joystick_forward  -> direction_name="forward"
+      joystick_reverse  -> direction_name="reverse"
+      joystick_left     -> direction_name="left"
+      joystick_right    -> direction_name="right"
+
+    This function does NOT assume ahead of time whether that direction is:
+      x positive, x negative, y positive, or y negative.
+
+    It observes the strongest movement phase and records the axis/sign/range.
+    """
+    samples = extract_two_byte_xy_samples(lines)
+
+    if not samples:
+        return {
+            "recognizer": f"joystick_{direction_name}",
+            "implemented": True,
+            "status": "timeout",
+            "summary": f"No two-byte CAN frames found during joystick {direction_name} test.",
+            "line_count": len(lines),
+            "sample_count": 0,
+            "ranked_candidates": [],
+            "best_candidate": None,
+        }
+
+    samples_by_id: dict[int, list[dict[str, Any]]] = {}
+    for sample in samples:
+        samples_by_id.setdefault(sample["can_id"], []).append(sample)
+
+    ranked_candidates: list[dict[str, Any]] = []
+
+    for can_id, id_samples in samples_by_id.items():
+        if len(id_samples) < 5:
+            continue
+
+        pair_counts = Counter((sample["x"], sample["y"]) for sample in id_samples)
+        center_pair, center_count = pair_counts.most_common(1)[0]
+        center_x, center_y = center_pair
+        center_fraction = center_count / len(id_samples)
+
+        phases = compress_joystick_motion_phases(
+            id_samples,
+            center_x=center_x,
+            center_y=center_y,
+            deadzone=deadzone,
+            min_phase_samples=2,
+        )
+
+        movement_phases = [
+            phase for phase in phases
+            if phase["kind"] == "movement"
+        ]
+
+        if movement_phases:
+            best_phase = max(
+                movement_phases,
+                key=lambda phase: max(
+                    phase["max_abs_dx"],
+                    phase["max_abs_dy"],
+                ),
+            )
+            direction_range = summarize_single_direction_phase(
+                direction_name,
+                best_phase,
+                center_x=center_x,
+                center_y=center_y,
+            )
+            movement_peak = direction_range["primary_abs_peak"] or 0
+        else:
+            best_phase = None
+            direction_range = None
+            movement_peak = 0
+
+        timestamps = [sample["timestamp"] for sample in id_samples]
+        duration_seconds = max(0.0, max(timestamps) - min(timestamps))
+        rate_hz = (
+            len(id_samples) / duration_seconds
+            if duration_seconds > 0
+            else None
+        )
+
+        xs = [sample["x"] for sample in id_samples]
+        ys = [sample["y"] for sample in id_samples]
+
+        rnet_family = looks_like_rnet_joystick_family(can_id)
+        channel_byte = (can_id >> 8) & 0xFF
+
+        score = 0.0
+
+        # Movement strength matters most for the independent direction tests.
+        score += movement_peak * 10.0
+
+        # Still prefer R-Net joystick-looking IDs.
+        if rnet_family:
+            score += 60.0
+            score += max(0.0, 32.0 - float(channel_byte))
+
+        # Prefer streams with enough samples and a visible center/rest value.
+        score += min(float(len(id_samples)) / 5.0, 40.0)
+        score += center_fraction * 30.0
+
+        if rate_hz is not None and rate_hz >= 10:
+            score += 20.0
+
+        ranked_candidates.append(
+            {
+                "can_id": f"0x{can_id:08X}",
+                "can_id_int": can_id,
+                "score": round(score, 3),
+                "rnet_joystick_family": rnet_family,
+                "channel_byte": f"0x{channel_byte:02X}",
+                "sample_count": len(id_samples),
+                "rate_hz": round(rate_hz, 3) if rate_hz is not None else None,
+                "center": {
+                    "x": center_x,
+                    "y": center_y,
+                    "sample_count": center_count,
+                    "fraction": round(center_fraction, 3),
+                },
+                "x_min": min(xs),
+                "x_max": max(xs),
+                "x_range": max(xs) - min(xs),
+                "y_min": min(ys),
+                "y_max": max(ys),
+                "y_range": max(ys) - min(ys),
+                "movement_phase_count": len(movement_phases),
+                "direction_range": direction_range,
+                "phases": phases[:20],
+            }
+        )
+
+    ranked_candidates.sort(
+        key=lambda candidate: candidate["score"],
+        reverse=True,
+    )
+
+    if not ranked_candidates:
+        return {
+            "recognizer": f"joystick_{direction_name}",
+            "implemented": True,
+            "status": "not_observed",
+            "summary": f"No usable joystick candidates found during {direction_name} test.",
+            "line_count": len(lines),
+            "sample_count": len(samples),
+            "ranked_candidates": [],
+            "best_candidate": None,
+        }
+
+    best = ranked_candidates[0]
+    direction_range = best["direction_range"]
+
+    if direction_range is None:
+        recognition_status = "not_observed"
+        summary = (
+            f"No clear joystick movement phase observed during {direction_name} test. "
+            f"Best candidate was {best['can_id']}."
+        )
+    elif (direction_range["primary_abs_peak"] or 0) > deadzone:
+        recognition_status = "confirmed"
+        summary = (
+            f"Observed joystick {direction_name} range on {best['can_id']}: "
+            f"axis={direction_range['axis']}, "
+            f"sign={direction_range['sign']}, "
+            f"peak={direction_range['signed_peak_from_center']} from center."
+        )
+    else:
+        recognition_status = "candidate"
+        summary = (
+            f"Found weak joystick {direction_name} movement candidate on {best['can_id']}, "
+            f"but peak was only {direction_range['primary_abs_peak']}."
+        )
+
+    return {
+        "recognizer": f"joystick_{direction_name}",
+        "implemented": True,
+        "status": recognition_status,
+        "summary": summary,
+        "line_count": len(lines),
+        "sample_count": len(samples),
+        "deadzone": deadzone,
+        "best_candidate": best,
+        "ranked_candidates": ranked_candidates[:12],
+    }
+
+def recognize_joystick_forward(lines: list[str]) -> dict[str, Any]:
+    return recognize_joystick_single_direction(
+        lines,
+        direction_name="forward",
+    )
+
+def recognize_joystick_reverse(lines: list[str]) -> dict[str, Any]:
+    return recognize_joystick_single_direction(
+        lines,
+        direction_name="reverse",
+    )
+
+def recognize_joystick_left(lines: list[str]) -> dict[str, Any]:
+    return recognize_joystick_single_direction(
+        lines,
+        direction_name="left",
+    )
+
+def recognize_joystick_right(lines: list[str]) -> dict[str, Any]:
+    return recognize_joystick_single_direction(
+        lines,
+        direction_name="right",
+    )
+
 def recognize_step(step_key: str, lines: list[str]) -> dict[str, Any]:
     """
     Dispatch step-specific recognition.
@@ -1564,6 +1858,18 @@ def recognize_step(step_key: str, lines: list[str]) -> dict[str, Any]:
 
     if step_key == "joystick_calibration":
         return recognize_joystick_calibration(lines)
+    
+    if step_key == "joystick_forward":
+        return recognize_joystick_forward(lines)
+
+    if step_key == "joystick_reverse":
+        return recognize_joystick_reverse(lines)
+
+    if step_key == "joystick_left":
+        return recognize_joystick_left(lines)
+
+    if step_key == "joystick_right":
+        return recognize_joystick_right(lines)
 
     return {
         "recognizer": None,
@@ -2107,42 +2413,46 @@ def build_default_steps() -> list[WizardStep]:
         ),
         WizardStep(
             key="joystick_forward",
-            title="8. Joystick forward",
+            title="8. Joystick forward range",
             prompt=(
-                "When listening starts, gently hold the joystick forward until "
-                "the countdown ends, then release."
+                "Prepare a clear, safe path forward. "
+                "When listening starts, gently push the joystick forward, hold briefly, "
+                "then release back to center."
             ),
-            timeout_seconds=5.0,
+            timeout_seconds=8.0,
             safety_note=drive_safety,
         ),
         WizardStep(
             key="joystick_reverse",
-            title="9. Joystick reverse",
+            title="9. Joystick reverse range",
             prompt=(
-                "When listening starts, gently hold the joystick backward until "
-                "the countdown ends, then release."
+                "Prepare a clear, safe path behind the chair. "
+                "When listening starts, gently pull the joystick backward/reverse, hold briefly, "
+                "then release back to center."
             ),
-            timeout_seconds=5.0,
+            timeout_seconds=8.0,
             safety_note=drive_safety,
         ),
         WizardStep(
             key="joystick_left",
-            title="10. Joystick left",
+            title="10. Joystick left range",
             prompt=(
-                "When listening starts, gently hold the joystick left until "
-                "the countdown ends, then release."
+                "Prepare a clear, safe area for a left turn or left joystick push. "
+                "When listening starts, gently push the joystick left, hold briefly, "
+                "then release back to center."
             ),
-            timeout_seconds=5.0,
+            timeout_seconds=8.0,
             safety_note=drive_safety,
         ),
         WizardStep(
             key="joystick_right",
-            title="11. Joystick right",
+            title="11. Joystick right range",
             prompt=(
-                "When listening starts, gently hold the joystick right until "
-                "the countdown ends, then release."
+                "Prepare a clear, safe area for a right turn or right joystick push. "
+                "When listening starts, gently push the joystick right, hold briefly, "
+                "then release back to center."
             ),
-            timeout_seconds=5.0,
+            timeout_seconds=8.0,
             safety_note=drive_safety,
         ),
         WizardStep(
