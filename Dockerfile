@@ -1,6 +1,8 @@
 FROM debian:trixie
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 RUN apt-get update && apt-get install -y \
     bash \
@@ -22,11 +24,13 @@ RUN apt-get update && apt-get install -y \
     debhelper \
     devscripts \
     dh-python \
-    systemd \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m venv /opt/venv \
+    && pip install --upgrade pip setuptools wheel \
+    && pip install python-can
 
 WORKDIR /work
 
 CMD ["/bin/bash"]
-
-RUN ln -sf /bin/bash /bin/sh
