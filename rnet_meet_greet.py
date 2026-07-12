@@ -2,6 +2,16 @@
 """
 rnet_meet_greet_skeleton.py - Passive R-Net chair capability discovery wizard.
 
+Example call: 
+python3 rnet_meet_greet.py \
+  --interface can0 \
+  --bustype socketcan \
+  --profile-name bumblebee \
+  --files-root meet_greet_files \
+  --output rnet_meet_greet_profile.json \
+  --replay-log-root meet_greet_log_snippets \
+  --replay-pick ask
+
 Future goals:
 1) multiple tests for range maximums for joystick inputs
 

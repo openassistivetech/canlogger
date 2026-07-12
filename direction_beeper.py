@@ -2,6 +2,11 @@
 """
 direction_beeper_profile.py - Direction-aware horn beeper for an R-Net wheelchair.
 
+Example call:
+python3 direction_beeper_updated.py \
+  --interface can0 \
+  --profile meet_greet_files/rnet_meet_greet_profile.json
+
 What this script does:
   - Listens for the chair-specific joystick CAN frame.
   - Classifies joystick movement as forward / reverse / left / right.
