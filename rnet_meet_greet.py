@@ -2,6 +2,9 @@
 """
 rnet_meet_greet_skeleton.py - Passive R-Net chair capability discovery wizard.
 
+Future goals: 
+1) multiple tests for range maximums for joystick inputs
+
 Purpose:
   Interactive wizard script that helps map chair-specific R-Net frames on a new wheelchair.
   It will prompt users through a series of steps, like "honk the horn", "toggle the left indicator", etc.
@@ -505,6 +508,54 @@ def summarize_single_direction_phase(
         "start_timestamp": phase["start_timestamp"],
         "end_timestamp": phase["end_timestamp"],
         "example_lines": phase["example_lines"],
+    }
+
+def frame_is_inside_any_window(
+    frame: dict[str, Any],
+    windows: list[dict[str, Any]],
+) -> bool:
+    timestamp = frame["timestamp"]
+
+    for window in windows:
+        if window["start_timestamp"] <= timestamp <= window["end_timestamp"]:
+            return True
+
+    return False
+
+
+def make_movement_window_from_phase(
+    label: str,
+    phase: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "label": label,
+        "start_timestamp": phase["start_timestamp"],
+        "end_timestamp": phase["end_timestamp"],
+        "duration_seconds": phase["duration_seconds"],
+        "axis": phase.get("axis"),
+        "sign": phase.get("sign"),
+        "state": phase.get("state"),
+        "signed_peak": phase.get("signed_peak"),
+    }
+
+
+def summarize_data_values(frames: list[dict[str, Any]], limit: int = 8) -> dict[str, Any]:
+    values = [frame["data_hex"] for frame in frames]
+    counts = Counter(values)
+
+    return {
+        "frame_count": len(frames),
+        "unique_value_count": len(counts),
+        "most_common_values": [
+            {
+                "data_hex": value,
+                "count": count,
+            }
+            for value, count in counts.most_common(limit)
+        ],
+        "example_lines": [
+            frame["raw"] for frame in frames[:5]
+        ],
     }
 
 # -----------------------------------------------------------------------------
@@ -1533,6 +1584,41 @@ def recognize_joystick_calibration(
         if rate_hz is not None and rate_hz >= 10:
             score += 20.0
 
+        movement_windows: list[dict[str, Any]] = []
+
+        # use inferred mapping to find likely drive response candidates
+        if inferred_mapping is not None:
+            for direction_name in ["forward", "reverse", "left", "right"]:
+                direction_info = inferred_mapping.get(direction_name)
+                if not direction_info:
+                    continue
+
+                phase = direction_info.get("phase")
+                if not phase:
+                    continue
+
+                movement_windows.append(
+                    make_movement_window_from_phase(
+                        direction_name,
+                        phase,
+                    )
+                )
+        else:
+            for index, phase in enumerate(movement_phases, start=1):
+                movement_windows.append(
+                    make_movement_window_from_phase(
+                        f"movement_{index}",
+                        phase,
+                    )
+                )
+
+        drive_response_candidates = recognize_drive_response_candidates(
+            lines,
+            movement_windows=movement_windows,
+            joystick_can_id=can_id,
+            source_step="joystick_calibration_low_movement",
+        )
+
         ranked_candidates.append(
             {
                 "can_id": f"0x{can_id:08X}",
@@ -1559,6 +1645,7 @@ def recognize_joystick_calibration(
                 "pattern_confirmed": pattern_confirmed,
                 "pattern_notes": pattern_notes,
                 "inferred_mapping": inferred_mapping,
+                "drive_response_candidates": drive_response_candidates,
                 "phases": phases[:20],
             }
         )
@@ -1696,6 +1783,23 @@ def recognize_joystick_single_direction(
             direction_range = None
             movement_peak = 0
 
+        movement_windows = []
+
+        if best_phase is not None:
+            movement_windows.append(
+                make_movement_window_from_phase(
+                    direction_name,
+                    best_phase,
+                )
+            )
+
+        drive_response_candidates = recognize_drive_response_candidates(
+            lines,
+            movement_windows=movement_windows,
+            joystick_can_id=can_id,
+            source_step=f"joystick_{direction_name}_large_movement",
+        )
+
         timestamps = [sample["timestamp"] for sample in id_samples]
         duration_seconds = max(0.0, max(timestamps) - min(timestamps))
         rate_hz = (
@@ -1750,6 +1854,7 @@ def recognize_joystick_single_direction(
                 "y_range": max(ys) - min(ys),
                 "movement_phase_count": len(movement_phases),
                 "direction_range": direction_range,
+                "drive_response_candidates": drive_response_candidates,
                 "phases": phases[:20],
             }
         )
@@ -1830,6 +1935,241 @@ def recognize_joystick_right(lines: list[str]) -> dict[str, Any]:
         lines,
         direction_name="right",
     )
+
+def recognize_drive_response_candidates(
+    lines: list[str],
+    *,
+    movement_windows: list[dict[str, Any]],
+    joystick_can_id: int | None,
+    source_step: str,
+    max_candidates: int = 12,
+) -> dict[str, Any]:
+    """
+    Rank non-joystick CAN IDs that appear to respond during joystick movement.
+
+    This is intentionally generic:
+      - It does not assume motor-current ID ahead of time.
+      - It does not assume data length or byte meaning.
+      - It scores frames that change during joystick movement windows.
+
+    Good candidates:
+      - have data during movement
+      - have movement values that differ from center/rest values
+      - show more variation during movement than during rest
+      - appear repeatedly enough to be meaningful
+    """
+    parsed_frames: list[dict[str, Any]] = []
+
+    for line in lines:
+        frame = parse_can_log_line(line)
+        if frame is None:
+            continue
+
+        # Ignore empty payloads for drive-response ranking.
+        if not frame["data_hex"]:
+            continue
+
+        parsed_frames.append(frame)
+
+    if not parsed_frames:
+        return {
+            "recognizer": "drive_response_candidates",
+            "implemented": True,
+            "status": "not_observed",
+            "summary": "No parseable data frames available for drive-response ranking.",
+            "source_step": source_step,
+            "movement_windows": movement_windows,
+            "ranked_candidates": [],
+        }
+
+    if not movement_windows:
+        return {
+            "recognizer": "drive_response_candidates",
+            "implemented": True,
+            "status": "not_observed",
+            "summary": "No joystick movement windows available for drive-response ranking.",
+            "source_step": source_step,
+            "movement_windows": movement_windows,
+            "ranked_candidates": [],
+        }
+
+    frames_by_id: dict[int, list[dict[str, Any]]] = {}
+
+    for frame in parsed_frames:
+        can_id = frame["can_id"]
+
+        # Do not rank the joystick command frame as a motor/controller response.
+        if joystick_can_id is not None and can_id == joystick_can_id:
+            continue
+
+        frames_by_id.setdefault(can_id, []).append(frame)
+
+    candidates: list[dict[str, Any]] = []
+
+    for can_id, id_frames in frames_by_id.items():
+        if len(id_frames) < 3:
+            continue
+
+        movement_frames = [
+            frame for frame in id_frames
+            if frame_is_inside_any_window(frame, movement_windows)
+        ]
+
+        rest_frames = [
+            frame for frame in id_frames
+            if not frame_is_inside_any_window(frame, movement_windows)
+        ]
+
+        if not movement_frames:
+            continue
+
+        movement_values = [frame["data_hex"] for frame in movement_frames]
+        rest_values = [frame["data_hex"] for frame in rest_frames]
+
+        movement_value_counts = Counter(movement_values)
+        rest_value_counts = Counter(rest_values)
+
+        movement_unique = set(movement_values)
+        rest_unique = set(rest_values)
+
+        movement_only_values = movement_unique - rest_unique
+
+        most_common_rest_value = None
+        if rest_value_counts:
+            most_common_rest_value = rest_value_counts.most_common(1)[0][0]
+
+        if most_common_rest_value is not None:
+            movement_changed_count = sum(
+                1 for value in movement_values
+                if value != most_common_rest_value
+            )
+            movement_changed_fraction = movement_changed_count / len(movement_values)
+        else:
+            movement_changed_count = len(movement_values)
+            movement_changed_fraction = 1.0
+
+        timestamps = [frame["timestamp"] for frame in id_frames]
+        duration_seconds = max(0.0, max(timestamps) - min(timestamps))
+        overall_rate_hz = (
+            len(id_frames) / duration_seconds
+            if duration_seconds > 0
+            else None
+        )
+
+        movement_window_duration = sum(
+            max(0.0, window["end_timestamp"] - window["start_timestamp"])
+            for window in movement_windows
+        )
+
+        movement_rate_hz = (
+            len(movement_frames) / movement_window_duration
+            if movement_window_duration > 0
+            else None
+        )
+
+        rest_duration = max(0.0, duration_seconds - movement_window_duration)
+        rest_rate_hz = (
+            len(rest_frames) / rest_duration
+            if rest_duration > 0
+            else None
+        )
+
+        score = 0.0
+
+        # Strong signal: values during movement differ from rest.
+        score += movement_changed_fraction * 80.0
+        score += min(len(movement_only_values) * 12.0, 60.0)
+
+        # Useful signal: movement window contains repeated frames.
+        score += min(len(movement_frames) * 2.0, 50.0)
+
+        # Useful signal: payload varies during movement.
+        score += min(len(movement_unique) * 8.0, 50.0)
+
+        # Slight boost if frame rate increases during movement.
+        if movement_rate_hz is not None and rest_rate_hz is not None:
+            if movement_rate_hz > rest_rate_hz * 1.25:
+                score += 20.0
+
+        # Penalize IDs that are totally constant.
+        if len(movement_unique) == 1 and len(rest_unique) == 1 and movement_unique == rest_unique:
+            score -= 100.0
+
+        # Penalize super-chatty constant status frames a little.
+        if len(movement_unique) <= 2 and movement_changed_fraction < 0.25:
+            score -= 30.0
+
+        candidates.append(
+            {
+                "can_id": f"0x{can_id:08X}",
+                "can_id_int": can_id,
+                "score": round(score, 3),
+                "source_step": source_step,
+
+                "total_frame_count": len(id_frames),
+                "movement_frame_count": len(movement_frames),
+                "rest_frame_count": len(rest_frames),
+
+                "overall_rate_hz": (
+                    round(overall_rate_hz, 3)
+                    if overall_rate_hz is not None
+                    else None
+                ),
+                "movement_rate_hz": (
+                    round(movement_rate_hz, 3)
+                    if movement_rate_hz is not None
+                    else None
+                ),
+                "rest_rate_hz": (
+                    round(rest_rate_hz, 3)
+                    if rest_rate_hz is not None
+                    else None
+                ),
+
+                "movement_changed_count": movement_changed_count,
+                "movement_changed_fraction": round(movement_changed_fraction, 3),
+                "movement_only_value_count": len(movement_only_values),
+                "movement_only_values": sorted(movement_only_values)[:12],
+
+                "rest_summary": summarize_data_values(rest_frames),
+                "movement_summary": summarize_data_values(movement_frames),
+            }
+        )
+
+    candidates.sort(
+        key=lambda candidate: candidate["score"],
+        reverse=True,
+    )
+
+    useful_candidates = [
+        candidate for candidate in candidates
+        if candidate["score"] > 0
+    ]
+
+    if useful_candidates:
+        status = "candidate"
+        summary = (
+            f"Found {len(useful_candidates)} drive-response candidate ID(s) "
+            f"during {source_step}."
+        )
+    else:
+        status = "not_observed"
+        summary = f"No useful drive-response candidates found during {source_step}."
+
+    return {
+        "recognizer": "drive_response_candidates",
+        "implemented": True,
+        "status": status,
+        "summary": summary,
+        "source_step": source_step,
+        "joystick_can_id": (
+            f"0x{joystick_can_id:08X}"
+            if joystick_can_id is not None
+            else None
+        ),
+        "movement_windows": movement_windows,
+        "ranked_candidates": useful_candidates[:max_candidates],
+    }
 
 def recognize_step(step_key: str, lines: list[str]) -> dict[str, Any]:
     """
