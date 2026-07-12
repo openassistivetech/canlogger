@@ -46,6 +46,7 @@ import json
 import re
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -169,6 +170,20 @@ def parse_can_log_line(line: str) -> dict[str, Any] | None:
         "data_hex": data_hex,
         "raw": line.rstrip("\n"),
     }
+
+def looks_like_rnet_joystick_family(can_id: int) -> bool:
+    """
+    Heuristic for R-Net joystick-like 29-bit IDs.
+
+    Known examples so far:
+      0x02000100
+      0x02000200
+
+    This intentionally does NOT hardcode those exact IDs.
+    It looks for the broader 0x0200NN00 shape.
+    """
+    return (can_id & 0xFFFF00FF) == 0x02000000
+
 # -----------------------------------------------------------------------------
 # Future expectation / recognition stubs
 # -----------------------------------------------------------------------------
@@ -212,6 +227,183 @@ def parse_can_log_line(line: str) -> dict[str, Any] | None:
 # def write_human_report(profile: MeetGreetProfile, path: Path) -> None:
 #     """Future: write a friendly report of confirmed/candidate/not-observed items."""
 #     pass
+
+def infer_joystick_id_from_idle_frames(
+    parsed_frames: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Infer likely joystick ID candidates from idle traffic.
+
+    Baseline assumptions:
+      - Joystick idle frame is usually a high-rate 2-byte frame.
+      - At rest, data is usually 0000.
+      - Known examples are in the 0x0200NN00 family.
+      - This is an inference from idle only, not final proof.
+
+    Returns a ranked candidate list plus the best candidate.
+    """
+    frames_by_id: dict[int, list[dict[str, Any]]] = {}
+
+    for frame in parsed_frames:
+        data_hex = frame["data_hex"]
+
+        # Joystick-style idle samples should be exactly two data bytes.
+        if len(data_hex) != 4:
+            continue
+
+        frames_by_id.setdefault(frame["can_id"], []).append(frame)
+
+    candidates: list[dict[str, Any]] = []
+
+    for can_id, frames in frames_by_id.items():
+        if len(frames) < 3:
+            continue
+
+        timestamps = [frame["timestamp"] for frame in frames]
+        first_timestamp = min(timestamps)
+        last_timestamp = max(timestamps)
+        duration_seconds = max(0.0, last_timestamp - first_timestamp)
+
+        if duration_seconds <= 0:
+            continue
+
+        count = len(frames)
+        rate_hz = count / duration_seconds
+
+        data_values = [frame["data_hex"] for frame in frames]
+        unique_data_values = sorted(set(data_values))
+        zero_count = sum(1 for value in data_values if value == "0000")
+        zero_fraction = zero_count / count if count else 0.0
+
+        intervals = [
+            later - earlier
+            for earlier, later in zip(timestamps, timestamps[1:])
+            if later >= earlier
+        ]
+
+        if intervals:
+            sorted_intervals = sorted(intervals)
+            median_interval = sorted_intervals[len(sorted_intervals) // 2]
+            min_interval = min(intervals)
+            max_interval = max(intervals)
+        else:
+            median_interval = None
+            min_interval = None
+            max_interval = None
+
+        rnet_family = looks_like_rnet_joystick_family(can_id)
+        channel_byte = (can_id >> 8) & 0xFF
+
+        # Scoring logic:
+        #   - high-rate 2-byte traffic matters most
+        #   - all-zero idle data is useful
+        #   - 0x0200NN00 family is useful
+        #   - lower NN values get a small preference over companion/status-like
+        #     high NN values such as 0x11
+        score = 0.0
+
+        score += min(rate_hz, 120.0)
+        score += zero_fraction * 40.0
+
+        if rnet_family:
+            score += 60.0
+            score += max(0.0, 32.0 - float(channel_byte))
+
+        # Penalize very slow things like motor current/status frames.
+        if rate_hz < 10.0:
+            score -= 50.0
+
+        # Prefer very regular streams near joystick-ish timing.
+        if median_interval is not None:
+            if 0.005 <= median_interval <= 0.05:
+                score += 20.0
+
+        candidates.append(
+            {
+                "can_id": f"0x{can_id:08X}",
+                "can_id_int": can_id,
+                "score": round(score, 3),
+                "rnet_joystick_family": rnet_family,
+                "channel_byte": f"0x{channel_byte:02X}",
+                "sample_count": count,
+                "rate_hz": round(rate_hz, 3),
+                "zero_count": zero_count,
+                "zero_fraction": round(zero_fraction, 3),
+                "unique_data_value_count": len(unique_data_values),
+                "example_data_values": unique_data_values[:8],
+                "first_timestamp": first_timestamp,
+                "last_timestamp": last_timestamp,
+                "duration_seconds": round(duration_seconds, 6),
+                "median_interval_seconds": (
+                    round(median_interval, 6)
+                    if median_interval is not None
+                    else None
+                ),
+                "min_interval_seconds": (
+                    round(min_interval, 6)
+                    if min_interval is not None
+                    else None
+                ),
+                "max_interval_seconds": (
+                    round(max_interval, 6)
+                    if max_interval is not None
+                    else None
+                ),
+                "example_lines": [
+                    frame["raw"]
+                    for frame in frames[:5]
+                ],
+            }
+        )
+
+    candidates.sort(key=lambda candidate: candidate["score"], reverse=True)
+
+    if not candidates:
+        return {
+            "implemented": True,
+            "status": "not_observed",
+            "summary": "No likely joystick idle ID candidates found.",
+            "best_candidate": None,
+            "ranked_candidates": [],
+        }
+
+    best = candidates[0]
+    second = candidates[1] if len(candidates) > 1 else None
+
+    if second is None:
+        confidence = "medium"
+        status = "candidate"
+        summary = (
+            f"Best joystick idle candidate is {best['can_id']} "
+            f"at ~{best['rate_hz']} Hz."
+        )
+    else:
+        score_gap = best["score"] - second["score"]
+
+        if score_gap >= 20:
+            confidence = "medium"
+        elif score_gap >= 8:
+            confidence = "low_medium"
+        else:
+            confidence = "low"
+
+        status = "candidate"
+        summary = (
+            f"Best joystick idle candidate is {best['can_id']} "
+            f"at ~{best['rate_hz']} Hz. "
+            f"Next candidate is {second['can_id']} "
+            f"at ~{second['rate_hz']} Hz. "
+            "Movement steps should confirm which ID carries X/Y."
+        )
+
+    return {
+        "implemented": True,
+        "status": status,
+        "summary": summary,
+        "confidence": confidence,
+        "best_candidate": best,
+        "ranked_candidates": candidates[:12],
+    }
 
 def recognize_horn_start_stop(lines: list[str]) -> dict[str, Any]:
     """
@@ -591,7 +783,6 @@ def recognize_left_indicator(lines: list[str]) -> dict[str, Any]:
         programmer_toggle_id=PROGRAMMER_LEFT_INDICATOR_TOGGLE_ID,
     )
 
-
 def recognize_right_indicator(lines: list[str]) -> dict[str, Any]:
     return recognize_indicator_toggle(
         lines,
@@ -739,12 +930,116 @@ def recognize_flood_headlight(lines: list[str]) -> dict[str, Any]:
         "status_events": status_events,
     }
 
+def recognize_baseline_idle(lines: list[str]) -> dict[str, Any]:
+    """
+    Summarize basic CAN traffic during the baseline step.
+
+    This intentionally does NOT check for known actions yet.
+    Baseline is the first meet-and-greet capture, so its job is only to answer:
+      - Did we capture anything?
+      - How many lines were parseable CAN frames?
+      - How many unique CAN IDs appeared?
+      - Which IDs were most common?
+      - Roughly how busy was the bus?
+    """
+    parsed_frames: list[dict[str, Any]] = []
+
+    for line in lines:
+        frame = parse_can_log_line(line)
+        if frame is not None:
+            parsed_frames.append(frame)
+
+    if not parsed_frames:
+        return {
+            "recognizer": "baseline_idle",
+            "implemented": True,
+            "status": "timeout",
+            "summary": "No parseable CAN frames observed during baseline capture.",
+            "line_count": len(lines),
+            "parsed_frame_count": 0,
+            "unique_id_count": 0,
+            "duration_seconds": 0.0,
+            "approx_frame_rate_hz": None,
+            "top_ids": [],
+            "joystick_idle_inference": {
+                "implemented": True,
+                "status": "not_observed",
+                "summary": "No parseable frames, so joystick ID could not be inferred.",
+                "best_candidate": None,
+                "ranked_candidates": [],
+            },
+        }
+    
+    timestamps = [frame["timestamp"] for frame in parsed_frames]
+    first_timestamp = min(timestamps)
+    last_timestamp = max(timestamps)
+    duration_seconds = max(0.0, last_timestamp - first_timestamp)
+
+    id_counter = Counter(frame["can_id"] for frame in parsed_frames)
+
+    top_ids = []
+    for can_id, count in id_counter.most_common(12):
+        top_ids.append(
+            {
+                "can_id": f"0x{can_id:08X}",
+                "count": count,
+                "approx_rate_hz": (
+                    round(count / duration_seconds, 3)
+                    if duration_seconds > 0
+                    else None
+                ),
+            }
+        )
+
+    frame_rate_hz = (
+        round(len(parsed_frames) / duration_seconds, 3)
+        if duration_seconds > 0
+        else None
+    )
+
+    summary = (
+        f"Captured {len(parsed_frames)} parseable CAN frame(s) "
+        f"across {len(id_counter)} unique CAN ID(s)"
+    )
+
+    if duration_seconds > 0:
+        summary += f" over {duration_seconds:.3f}s"
+        if frame_rate_hz is not None:
+            summary += f" (~{frame_rate_hz} frames/sec)"
+
+    summary += ". "
+
+    # Infer joystick ID from idle frames. This is best candidate for joystick, 
+    # won't be confirmed until later tests.
+    joystick_idle_inference = infer_joystick_id_from_idle_frames(parsed_frames)
+    summary += joystick_idle_inference["summary"]
+
+    return {
+        "recognizer": "baseline_idle",
+        "implemented": True,
+        "status": "confirmed",
+        "summary": summary,
+        "line_count": len(lines),
+        "parsed_frame_count": len(parsed_frames),
+        "unique_id_count": len(id_counter),
+        "first_timestamp": first_timestamp,
+        "last_timestamp": last_timestamp,
+        "duration_seconds": round(duration_seconds, 6),
+        "approx_frame_rate_hz": frame_rate_hz,
+        "top_ids": top_ids,
+        "joystick_idle_inference": joystick_idle_inference,
+    }
+
 def recognize_step(step_key: str, lines: list[str]) -> dict[str, Any]:
     """
     Dispatch step-specific recognition.
 
     Keep adding recognizers for different step types here.
     """
+
+    if step_key == "baseline_idle":
+        return recognize_baseline_idle(lines)
+
     if step_key == "horn":
         return recognize_horn_start_stop(lines)
 
