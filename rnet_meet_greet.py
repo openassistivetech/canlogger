@@ -570,32 +570,12 @@ def summarize_data_values(frames: list[dict[str, Any]], limit: int = 8) -> dict[
 #     """Future: cleanly close CAN bus."""
 #     pass
 
-# def collect_baseline(bus, duration_seconds: float) -> list:
-#     """Future: collect idle frames for comparison."""
-#     pass
-
 # def collect_action_window(bus, duration_seconds: float) -> list:
 #     """Future: collect frames while the user performs the requested action."""
 #     pass
 
-# def rank_candidate_frames(baseline_frames: list, action_frames: list) -> list:
-#     """Future: find frames that appear/change during the action but not baseline."""
-#     pass
-
-# def recognize_joystick_axis(action_name: str, baseline_frames: list, action_frames: list) -> dict:
-#     """Future: infer joystick ID, byte positions, signedness, polarity, min/max."""
-#     pass
-
-# def recognize_motor_current(baseline_frames: list, action_frames: list) -> dict:
-#     """Future: infer motor-current or motion-state frame candidates."""
-#     pass
-
 # def confirm_candidate_by_repetition(candidate: dict, repeated_action_frames: list) -> bool:
 #     """Future: confirm that a candidate repeats on a second/third trial."""
-#     pass
-
-# def write_yaml_profile(profile: MeetGreetProfile, path: Path) -> None:
-#     """Future: write YAML profile once PyYAML or manual serializer is chosen."""
 #     pass
 
 # def write_human_report(profile: MeetGreetProfile, path: Path) -> None:
@@ -1669,26 +1649,32 @@ def recognize_joystick_calibration(
 
     best = ranked_candidates[0]
 
+    drive_response_note = summarize_top_drive_response_candidates(
+        best.get("drive_response_candidates"),
+    )
+
     if best["pattern_confirmed"]:
         recognition_status = "confirmed"
         summary = (
             f"Confirmed joystick candidate {best['can_id']}. "
             f"Center appears to be X={best['center']['x']}, Y={best['center']['y']}. "
-            "Movement pattern identified forward/reverse and left/right axes."
+            "Movement pattern identified forward/reverse and left/right axes. "
+            f"{drive_response_note}"
         )
     elif len(best["unique_movement_states"]) >= 2:
         recognition_status = "candidate"
         summary = (
             f"Found joystick-like movement candidate {best['can_id']}, "
-            "but the full forward/reverse/left/right pattern was not clearly confirmed."
+            "but the full forward/reverse/left/right pattern was not clearly confirmed. "
+            f"{drive_response_note}"
         )
     else:
         recognition_status = "not_observed"
         summary = (
             "No clear joystick movement pattern observed. "
-            f"Best candidate was {best['can_id']}."
+            f"Best candidate was {best['can_id']}. "
+            f"{drive_response_note}"
         )
-
     return {
         "recognizer": "joystick_calibration",
         "implemented": True,
@@ -1879,11 +1865,16 @@ def recognize_joystick_single_direction(
     best = ranked_candidates[0]
     direction_range = best["direction_range"]
 
+    drive_response_note = summarize_top_drive_response_candidates(
+        best.get("drive_response_candidates"),
+    )
+
     if direction_range is None:
         recognition_status = "not_observed"
         summary = (
             f"No clear joystick movement phase observed during {direction_name} test. "
-            f"Best candidate was {best['can_id']}."
+            f"Best candidate was {best['can_id']}. "
+            f"{drive_response_note}"
         )
     elif (direction_range["primary_abs_peak"] or 0) > deadzone:
         recognition_status = "confirmed"
@@ -1891,13 +1882,15 @@ def recognize_joystick_single_direction(
             f"Observed joystick {direction_name} range on {best['can_id']}: "
             f"axis={direction_range['axis']}, "
             f"sign={direction_range['sign']}, "
-            f"peak={direction_range['signed_peak_from_center']} from center."
+            f"peak={direction_range['signed_peak_from_center']} from center. "
+            f"{drive_response_note}"
         )
     else:
         recognition_status = "candidate"
         summary = (
             f"Found weak joystick {direction_name} movement candidate on {best['can_id']}, "
-            f"but peak was only {direction_range['primary_abs_peak']}."
+            f"but peak was only {direction_range['primary_abs_peak']}. "
+            f"{drive_response_note}"
         )
 
     return {
@@ -2170,6 +2163,52 @@ def recognize_drive_response_candidates(
         "movement_windows": movement_windows,
         "ranked_candidates": useful_candidates[:max_candidates],
     }
+
+def summarize_top_drive_response_candidates(
+    drive_response: dict[str, Any] | None,
+    *,
+    limit: int = 3,
+) -> str:
+    """
+    Short human-readable note for joystick summaries.
+
+    Example:
+      Likely drive-response candidates: 0x14300000 score=124.5,
+      0x1C300004 score=88.0.
+    """
+    if not drive_response:
+        return "No drive-response candidate scan was available."
+
+    candidates = drive_response.get("ranked_candidates", [])
+
+    if not candidates:
+        return "No likely drive-response candidates found."
+
+    top = candidates[:limit]
+
+    parts = []
+    for candidate in top:
+        can_id = candidate.get("can_id", "unknown")
+        score = candidate.get("score", "?")
+        changed_fraction = candidate.get("movement_changed_fraction")
+
+        if changed_fraction is None:
+            parts.append(f"{can_id} score={score}")
+        else:
+            parts.append(
+                f"{can_id} score={score}, changed={changed_fraction}"
+            )
+
+    extra_count = len(candidates) - len(top)
+
+    note = "Likely drive-response candidates: " + "; ".join(parts)
+
+    if extra_count > 0:
+        note += f"; plus {extra_count} more"
+
+    note += "."
+
+    return note
 
 def recognize_step(step_key: str, lines: list[str]) -> dict[str, Any]:
     """
@@ -2573,7 +2612,7 @@ def run_live_step(
             key=step.key,
             title=step.title,
             status="timeout",
-            notes=["Listening window completed; no recognition logic implemented yet."],
+            notes=["Listening window completed"],
         )
     if label == "failed":
         return StepResult(
@@ -2845,7 +2884,6 @@ def print_summary(profile: MeetGreetProfile) -> None:
     for key, result in profile.steps.items():
         print("%-22s %-10s %s" % (key, result.status, result.title))
     print()
-    print("No recognition has been implemented yet; these are interaction-flow results only.")
 
 
 def parse_args() -> argparse.Namespace:
