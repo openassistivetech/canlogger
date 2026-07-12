@@ -2,15 +2,15 @@
 """
 rnet_meet_greet_skeleton.py - Passive R-Net chair capability discovery wizard.
 
-Future goals: 
+Future goals:
 1) multiple tests for range maximums for joystick inputs
 
 Purpose:
   Interactive wizard script that helps map chair-specific R-Net frames on a new wheelchair.
   It will prompt users through a series of steps, like "honk the horn", "toggle the left indicator", etc.
-  For each interaction step it will listen for 10 seconds and write the log snippet to a file. 
-  After the session we will have a json file containing the results, a txt file with a summary that's easy to read 
-  and raw logs in the following folder structure: 
+  For each interaction step it will listen for 10 seconds and write the log snippet to a file.
+  After the session we will have a json file containing the results, a txt file with a summary that's easy to read
+  and raw logs in the following folder structure:
   meet_greet_log_snippets/
     horn_honk/
     left_indicator/
@@ -55,8 +55,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
-
-StepStatus = Literal["not_run", "skipped", "timeout", "candidate", "confirmed", "failed"]
+StepStatus = Literal[
+    "not_run", "skipped", "timeout", "candidate", "confirmed", "failed"
+]
 
 LOG_SNIPPET_ROOT_DEFAULT = "meet_greet_log_snippets"
 LISTEN_SECONDS_DEFAULT = 10.0
@@ -71,7 +72,7 @@ LEFT_INDICATOR_TOGGLE_ID = 0x0C000101
 RIGHT_INDICATOR_TOGGLE_ID = 0x0C000102
 FLOOD_HEADLIGHT_TOGGLE_ID = 0x0C000104
 
-# Optional UI/status evidence (displays on the screen-enabled joysticks when the signals are flashing). 
+# Optional UI/status evidence (displays on the screen-enabled joysticks when the signals are flashing).
 # Useful, but weaker than the physical toggle.
 LAMP_STATUS_ID = 0x0C000400
 LAMP_HAZARD = 0x10
@@ -84,6 +85,7 @@ PROGRAMMER_HAZARD_TOGGLE_ID = 0x0C000F03
 PROGRAMMER_LEFT_INDICATOR_TOGGLE_ID = 0x0C000F01
 PROGRAMMER_RIGHT_INDICATOR_TOGGLE_ID = 0x0C000F02
 PROGRAMMER_FLOOD_HEADLIGHT_TOGGLE_ID = 0x0C000F04
+
 
 @dataclass
 class StepResult:
@@ -123,11 +125,13 @@ class WizardStep:
     safety_note: str = ""
     optional: bool = True
 
+
 CAN_LOG_LINE_RE = re.compile(
     r"^\((?P<timestamp>\d+(?:\.\d+)?)\)\s+"
     r"(?P<interface>\S+)\s+"
     r"(?P<can_id>[0-9A-Fa-f]+)#(?P<data>[0-9A-Fa-f]*)"
 )
+
 
 def data_hex_to_bytes(data_hex: str) -> bytes:
     """Safely decode CAN data hex into bytes."""
@@ -135,6 +139,7 @@ def data_hex_to_bytes(data_hex: str) -> bytes:
         return bytes.fromhex(data_hex)
     except ValueError:
         return b""
+
 
 def parse_can_log_line(line: str) -> dict[str, Any] | None:
     """
@@ -175,11 +180,13 @@ def parse_can_log_line(line: str) -> dict[str, Any] | None:
         "raw": line.rstrip("\n"),
     }
 
+
 def signed_int8(value: int) -> int:
     """Interpret one byte as signed int8."""
     if value >= 128:
         return value - 256
     return value
+
 
 def looks_like_rnet_joystick_family(can_id: int) -> bool:
     """
@@ -193,6 +200,7 @@ def looks_like_rnet_joystick_family(can_id: int) -> bool:
     It looks for the broader 0x0200NN00 shape.
     """
     return (can_id & 0xFFFF00FF) == 0x02000000
+
 
 def joystick_state_from_xy(
     x: int,
@@ -238,6 +246,7 @@ def states_are_opposites(a: str, b: str) -> bool:
         and sign_a == -sign_b
     )
 
+
 def extract_two_byte_xy_samples(lines: list[str]) -> list[dict[str, Any]]:
     """
     Extract all two-byte CAN frames as possible X/Y joystick samples.
@@ -271,6 +280,7 @@ def extract_two_byte_xy_samples(lines: list[str]) -> list[dict[str, Any]]:
 
     return samples
 
+
 def sample_is_centered(
     sample: dict[str, Any],
     *,
@@ -281,6 +291,7 @@ def sample_is_centered(
     dx = sample["x"] - center_x
     dy = sample["y"] - center_y
     return abs(dx) <= deadzone and abs(dy) <= deadzone
+
 
 def compress_joystick_motion_phases(
     samples: list[dict[str, Any]],
@@ -349,9 +360,7 @@ def compress_joystick_motion_phases(
                 "x_max": max(xs),
                 "y_min": min(ys),
                 "y_max": max(ys),
-                "example_lines": [
-                    sample["raw"] for sample in phase_samples[:3]
-                ],
+                "example_lines": [sample["raw"] for sample in phase_samples[:3]],
             }
 
         # For a movement phase, choose the dominant axis over the whole phase,
@@ -369,9 +378,7 @@ def compress_joystick_motion_phases(
         smaller_peak = min(max_abs_dx, max_abs_dy)
         larger_peak = max(max_abs_dx, max_abs_dy)
         dominance_ratio = (
-            round(larger_peak / smaller_peak, 3)
-            if smaller_peak > 0
-            else None
+            round(larger_peak / smaller_peak, 3) if smaller_peak > 0 else None
         )
 
         return {
@@ -394,9 +401,7 @@ def compress_joystick_motion_phases(
             "x_max": max(xs),
             "y_min": min(ys),
             "y_max": max(ys),
-            "example_lines": [
-                sample["raw"] for sample in phase_samples[:3]
-            ],
+            "example_lines": [sample["raw"] for sample in phase_samples[:3]],
         }
 
     def flush_phase() -> None:
@@ -432,6 +437,7 @@ def compress_joystick_motion_phases(
     flush_phase()
 
     return phases
+
 
 def summarize_single_direction_phase(
     direction_name: str,
@@ -481,34 +487,29 @@ def summarize_single_direction_phase(
         "axis": axis,
         "sign": sign,
         "signed_peak_from_center": phase["signed_peak"],
-
         "primary_delta_min": primary_delta_min,
         "primary_delta_max": primary_delta_max,
         "primary_abs_peak": primary_abs_peak,
-
         "off_axis": off_axis,
         "off_axis_abs_peak": off_axis_abs_peak,
         "dominance_ratio": phase["dominance_ratio"],
-
         "center_x": center_x,
         "center_y": center_y,
-
         "x_min": phase["x_min"],
         "x_max": phase["x_max"],
         "y_min": phase["y_min"],
         "y_max": phase["y_max"],
-
         "dx_min": dx_min,
         "dx_max": dx_max,
         "dy_min": dy_min,
         "dy_max": dy_max,
-
         "sample_count": phase["sample_count"],
         "duration_seconds": phase["duration_seconds"],
         "start_timestamp": phase["start_timestamp"],
         "end_timestamp": phase["end_timestamp"],
         "example_lines": phase["example_lines"],
     }
+
 
 def frame_is_inside_any_window(
     frame: dict[str, Any],
@@ -539,7 +540,9 @@ def make_movement_window_from_phase(
     }
 
 
-def summarize_data_values(frames: list[dict[str, Any]], limit: int = 8) -> dict[str, Any]:
+def summarize_data_values(
+    frames: list[dict[str, Any]], limit: int = 8
+) -> dict[str, Any]:
     values = [frame["data_hex"] for frame in frames]
     counts = Counter(values)
 
@@ -553,10 +556,9 @@ def summarize_data_values(frames: list[dict[str, Any]], limit: int = 8) -> dict[
             }
             for value, count in counts.most_common(limit)
         ],
-        "example_lines": [
-            frame["raw"] for frame in frames[:5]
-        ],
+        "example_lines": [frame["raw"] for frame in frames[:5]],
     }
+
 
 def parse_can_id_value(value: Any) -> int | None:
     if value is None:
@@ -601,8 +603,7 @@ def get_confirmed_joystick_can_id(profile: MeetGreetProfile) -> int | None:
     best_candidate = recognition.get("best_candidate") or {}
 
     return parse_can_id_value(
-        best_candidate.get("can_id_int")
-        or best_candidate.get("can_id")
+        best_candidate.get("can_id_int") or best_candidate.get("can_id")
     )
 
 
@@ -627,8 +628,7 @@ def update_profile_from_step_result(
     best_candidate = recognition.get("best_candidate") or {}
 
     joystick_can_id_int = parse_can_id_value(
-        best_candidate.get("can_id_int")
-        or best_candidate.get("can_id")
+        best_candidate.get("can_id_int") or best_candidate.get("can_id")
     )
 
     if joystick_can_id_int is None:
@@ -638,6 +638,7 @@ def update_profile_from_step_result(
     profile.confirmed["joystick_can_id_int"] = joystick_can_id_int
     profile.confirmed["joystick_center"] = best_candidate.get("center")
     profile.confirmed["joystick_mapping"] = best_candidate.get("inferred_mapping")
+
 
 # -----------------------------------------------------------------------------
 # Future expectation / recognition stubs
@@ -662,6 +663,7 @@ def update_profile_from_step_result(
 # def write_human_report(profile: MeetGreetProfile, path: Path) -> None:
 #     """Future: write a friendly report of confirmed/candidate/not-observed items."""
 #     pass
+
 
 def infer_joystick_id_from_idle_frames(
     parsed_frames: list[dict[str, Any]],
@@ -770,24 +772,15 @@ def infer_joystick_id_from_idle_frames(
                 "last_timestamp": last_timestamp,
                 "duration_seconds": round(duration_seconds, 6),
                 "median_interval_seconds": (
-                    round(median_interval, 6)
-                    if median_interval is not None
-                    else None
+                    round(median_interval, 6) if median_interval is not None else None
                 ),
                 "min_interval_seconds": (
-                    round(min_interval, 6)
-                    if min_interval is not None
-                    else None
+                    round(min_interval, 6) if min_interval is not None else None
                 ),
                 "max_interval_seconds": (
-                    round(max_interval, 6)
-                    if max_interval is not None
-                    else None
+                    round(max_interval, 6) if max_interval is not None else None
                 ),
-                "example_lines": [
-                    frame["raw"]
-                    for frame in frames[:5]
-                ],
+                "example_lines": [frame["raw"] for frame in frames[:5]],
             }
         )
 
@@ -840,6 +833,7 @@ def infer_joystick_id_from_idle_frames(
         "ranked_candidates": candidates[:12],
     }
 
+
 def recognize_horn_start_stop(lines: list[str]) -> dict[str, Any]:
     """
     Recognize a simple R-Net horn start/stop pattern.
@@ -861,14 +855,10 @@ def recognize_horn_start_stop(lines: list[str]) -> dict[str, Any]:
             parsed_frames.append(frame)
 
     start_events = [
-        frame for frame in parsed_frames
-        if frame["can_id"] == HORN_START_ID
+        frame for frame in parsed_frames if frame["can_id"] == HORN_START_ID
     ]
 
-    stop_events = [
-        frame for frame in parsed_frames
-        if frame["can_id"] == HORN_STOP_ID
-    ]
+    stop_events = [frame for frame in parsed_frames if frame["can_id"] == HORN_STOP_ID]
 
     pairs: list[dict[str, Any]] = []
     unused_stops = stop_events.copy()
@@ -927,6 +917,7 @@ def recognize_horn_start_stop(lines: list[str]) -> dict[str, Any]:
         "pairs": pairs,
     }
 
+
 def recognize_hazard_lights(lines: list[str]) -> dict[str, Any]:
     """
     Recognize hazard-light activity.
@@ -952,14 +943,18 @@ def recognize_hazard_lights(lines: list[str]) -> dict[str, Any]:
             parsed_frames.append(frame)
 
     physical_toggle_events = [
-        frame for frame in parsed_frames
-        if frame["can_id"] == HAZARD_TOGGLE_ID
+        frame for frame in parsed_frames if frame["can_id"] == HAZARD_TOGGLE_ID
     ]
 
-    programmer_toggle_events = [
-        frame for frame in parsed_frames
-        if frame["can_id"] == PROGRAMMER_HAZARD_TOGGLE_ID
-    ] if "PROGRAMMER_HAZARD_TOGGLE_ID" in globals() else []
+    programmer_toggle_events = (
+        [
+            frame
+            for frame in parsed_frames
+            if frame["can_id"] == PROGRAMMER_HAZARD_TOGGLE_ID
+        ]
+        if "PROGRAMMER_HAZARD_TOGGLE_ID" in globals()
+        else []
+    )
 
     status_events: list[dict[str, Any]] = []
 
@@ -1065,6 +1060,7 @@ def recognize_hazard_lights(lines: list[str]) -> dict[str, Any]:
         "status_events": status_events,
     }
 
+
 def recognize_indicator_toggle(
     lines: list[str],
     *,
@@ -1093,14 +1089,12 @@ def recognize_indicator_toggle(
             parsed_frames.append(frame)
 
     physical_toggle_events = [
-        frame for frame in parsed_frames
-        if frame["can_id"] == physical_toggle_id
+        frame for frame in parsed_frames if frame["can_id"] == physical_toggle_id
     ]
 
     if programmer_toggle_id is not None:
         programmer_toggle_events = [
-            frame for frame in parsed_frames
-            if frame["can_id"] == programmer_toggle_id
+            frame for frame in parsed_frames if frame["can_id"] == programmer_toggle_id
         ]
     else:
         programmer_toggle_events = []
@@ -1209,6 +1203,7 @@ def recognize_indicator_toggle(
         "status_events": status_events,
     }
 
+
 def recognize_left_indicator(lines: list[str]) -> dict[str, Any]:
     return recognize_indicator_toggle(
         lines,
@@ -1218,6 +1213,7 @@ def recognize_left_indicator(lines: list[str]) -> dict[str, Any]:
         programmer_toggle_id=PROGRAMMER_LEFT_INDICATOR_TOGGLE_ID,
     )
 
+
 def recognize_right_indicator(lines: list[str]) -> dict[str, Any]:
     return recognize_indicator_toggle(
         lines,
@@ -1226,6 +1222,7 @@ def recognize_right_indicator(lines: list[str]) -> dict[str, Any]:
         status_bit=LAMP_RIGHT,
         programmer_toggle_id=PROGRAMMER_RIGHT_INDICATOR_TOGGLE_ID,
     )
+
 
 def recognize_flood_headlight(lines: list[str]) -> dict[str, Any]:
     """
@@ -1252,12 +1249,12 @@ def recognize_flood_headlight(lines: list[str]) -> dict[str, Any]:
             parsed_frames.append(frame)
 
     physical_toggle_events = [
-        frame for frame in parsed_frames
-        if frame["can_id"] == FLOOD_HEADLIGHT_TOGGLE_ID
+        frame for frame in parsed_frames if frame["can_id"] == FLOOD_HEADLIGHT_TOGGLE_ID
     ]
 
     programmer_toggle_events = [
-        frame for frame in parsed_frames
+        frame
+        for frame in parsed_frames
         if frame["can_id"] == PROGRAMMER_FLOOD_HEADLIGHT_TOGGLE_ID
     ]
 
@@ -1365,6 +1362,7 @@ def recognize_flood_headlight(lines: list[str]) -> dict[str, Any]:
         "status_events": status_events,
     }
 
+
 def recognize_baseline_idle(lines: list[str]) -> dict[str, Any]:
     """
     Summarize basic CAN traffic during the baseline step.
@@ -1404,7 +1402,7 @@ def recognize_baseline_idle(lines: list[str]) -> dict[str, Any]:
                 "ranked_candidates": [],
             },
         }
-    
+
     timestamps = [frame["timestamp"] for frame in parsed_frames]
     first_timestamp = min(timestamps)
     last_timestamp = max(timestamps)
@@ -1419,9 +1417,7 @@ def recognize_baseline_idle(lines: list[str]) -> dict[str, Any]:
                 "can_id": f"0x{can_id:08X}",
                 "count": count,
                 "approx_rate_hz": (
-                    round(count / duration_seconds, 3)
-                    if duration_seconds > 0
-                    else None
+                    round(count / duration_seconds, 3) if duration_seconds > 0 else None
                 ),
             }
         )
@@ -1444,7 +1440,7 @@ def recognize_baseline_idle(lines: list[str]) -> dict[str, Any]:
 
     summary += ". "
 
-    # Infer joystick ID from idle frames. This is best candidate for joystick, 
+    # Infer joystick ID from idle frames. This is best candidate for joystick,
     # won't be confirmed until later tests.
     joystick_idle_inference = infer_joystick_id_from_idle_frames(parsed_frames)
     summary += joystick_idle_inference["summary"]
@@ -1464,6 +1460,7 @@ def recognize_baseline_idle(lines: list[str]) -> dict[str, Any]:
         "top_ids": top_ids,
         "joystick_idle_inference": joystick_idle_inference,
     }
+
 
 def recognize_joystick_calibration(
     lines: list[str],
@@ -1521,14 +1518,9 @@ def recognize_joystick_calibration(
             deadzone=deadzone,
         )
 
-        movement_phases = [
-            phase for phase in phases
-            if phase["kind"] == "movement"
-        ]
+        movement_phases = [phase for phase in phases if phase["kind"] == "movement"]
 
-        movement_states = [
-            phase["state"] for phase in movement_phases
-        ]
+        movement_states = [phase["state"] for phase in movement_phases]
 
         unique_movement_states = sorted(set(movement_states))
 
@@ -1567,9 +1559,7 @@ def recognize_joystick_calibration(
             )
 
             pattern_confirmed = (
-                forward_reverse_opposed
-                and left_right_opposed
-                and axes_different
+                forward_reverse_opposed and left_right_opposed and axes_different
             )
 
             inferred_mapping = {
@@ -1605,9 +1595,13 @@ def recognize_joystick_calibration(
             if not forward_reverse_opposed:
                 pattern_notes.append("First two movement phases were not opposites.")
             if not left_right_opposed:
-                pattern_notes.append("Third and fourth movement phases were not opposites.")
+                pattern_notes.append(
+                    "Third and fourth movement phases were not opposites."
+                )
             if not axes_different:
-                pattern_notes.append("Forward/reverse axis and left/right axis were not clearly different.")
+                pattern_notes.append(
+                    "Forward/reverse axis and left/right axis were not clearly different."
+                )
         else:
             pattern_notes.append(
                 f"Only found {len(movement_phases)} movement phase(s); expected at least 4."
@@ -1615,11 +1609,7 @@ def recognize_joystick_calibration(
 
         timestamps = [sample["timestamp"] for sample in id_samples]
         duration_seconds = max(0.0, max(timestamps) - min(timestamps))
-        rate_hz = (
-            len(id_samples) / duration_seconds
-            if duration_seconds > 0
-            else None
-        )
+        rate_hz = len(id_samples) / duration_seconds if duration_seconds > 0 else None
 
         rnet_family = looks_like_rnet_joystick_family(can_id)
         channel_byte = (can_id >> 8) & 0xFF
@@ -1768,6 +1758,7 @@ def recognize_joystick_calibration(
         "ranked_candidates": ranked_candidates[:12],
     }
 
+
 def recognize_joystick_single_direction(
     lines: list[str],
     *,
@@ -1840,10 +1831,7 @@ def recognize_joystick_single_direction(
             min_phase_samples=2,
         )
 
-        movement_phases = [
-            phase for phase in phases
-            if phase["kind"] == "movement"
-        ]
+        movement_phases = [phase for phase in phases if phase["kind"] == "movement"]
 
         if movement_phases:
             best_phase = max(
@@ -1884,11 +1872,7 @@ def recognize_joystick_single_direction(
 
         timestamps = [sample["timestamp"] for sample in id_samples]
         duration_seconds = max(0.0, max(timestamps) - min(timestamps))
-        rate_hz = (
-            len(id_samples) / duration_seconds
-            if duration_seconds > 0
-            else None
-        )
+        rate_hz = len(id_samples) / duration_seconds if duration_seconds > 0 else None
 
         xs = [sample["x"] for sample in id_samples]
         ys = [sample["y"] for sample in id_samples]
@@ -2008,6 +1992,7 @@ def recognize_joystick_single_direction(
         "ranked_candidates": ranked_candidates[:12],
     }
 
+
 def recognize_joystick_forward(
     lines: list[str],
     *,
@@ -2018,6 +2003,7 @@ def recognize_joystick_forward(
         direction_name="forward",
         known_joystick_can_id=known_joystick_can_id,
     )
+
 
 def recognize_joystick_reverse(
     lines: list[str],
@@ -2030,6 +2016,7 @@ def recognize_joystick_reverse(
         known_joystick_can_id=known_joystick_can_id,
     )
 
+
 def recognize_joystick_left(
     lines: list[str],
     *,
@@ -2041,6 +2028,7 @@ def recognize_joystick_left(
         known_joystick_can_id=known_joystick_can_id,
     )
 
+
 def recognize_joystick_right(
     lines: list[str],
     *,
@@ -2051,6 +2039,7 @@ def recognize_joystick_right(
         direction_name="right",
         known_joystick_can_id=known_joystick_can_id,
     )
+
 
 def recognize_drive_response_candidates(
     lines: list[str],
@@ -2130,12 +2119,14 @@ def recognize_drive_response_candidates(
             continue
 
         movement_frames = [
-            frame for frame in id_frames
+            frame
+            for frame in id_frames
             if frame_is_inside_any_window(frame, movement_windows)
         ]
 
         rest_frames = [
-            frame for frame in id_frames
+            frame
+            for frame in id_frames
             if not frame_is_inside_any_window(frame, movement_windows)
         ]
 
@@ -2159,8 +2150,7 @@ def recognize_drive_response_candidates(
 
         if most_common_rest_value is not None:
             movement_changed_count = sum(
-                1 for value in movement_values
-                if value != most_common_rest_value
+                1 for value in movement_values if value != most_common_rest_value
             )
             movement_changed_fraction = movement_changed_count / len(movement_values)
         else:
@@ -2170,9 +2160,7 @@ def recognize_drive_response_candidates(
         timestamps = [frame["timestamp"] for frame in id_frames]
         duration_seconds = max(0.0, max(timestamps) - min(timestamps))
         overall_rate_hz = (
-            len(id_frames) / duration_seconds
-            if duration_seconds > 0
-            else None
+            len(id_frames) / duration_seconds if duration_seconds > 0 else None
         )
 
         movement_window_duration = sum(
@@ -2187,11 +2175,7 @@ def recognize_drive_response_candidates(
         )
 
         rest_duration = max(0.0, duration_seconds - movement_window_duration)
-        rest_rate_hz = (
-            len(rest_frames) / rest_duration
-            if rest_duration > 0
-            else None
-        )
+        rest_rate_hz = len(rest_frames) / rest_duration if rest_duration > 0 else None
 
         score = 0.0
 
@@ -2211,7 +2195,11 @@ def recognize_drive_response_candidates(
                 score += 20.0
 
         # Penalize IDs that are totally constant.
-        if len(movement_unique) == 1 and len(rest_unique) == 1 and movement_unique == rest_unique:
+        if (
+            len(movement_unique) == 1
+            and len(rest_unique) == 1
+            and movement_unique == rest_unique
+        ):
             score -= 100.0
 
         # Penalize super-chatty constant status frames a little.
@@ -2224,32 +2212,22 @@ def recognize_drive_response_candidates(
                 "can_id_int": can_id,
                 "score": round(score, 3),
                 "source_step": source_step,
-
                 "total_frame_count": len(id_frames),
                 "movement_frame_count": len(movement_frames),
                 "rest_frame_count": len(rest_frames),
-
                 "overall_rate_hz": (
-                    round(overall_rate_hz, 3)
-                    if overall_rate_hz is not None
-                    else None
+                    round(overall_rate_hz, 3) if overall_rate_hz is not None else None
                 ),
                 "movement_rate_hz": (
-                    round(movement_rate_hz, 3)
-                    if movement_rate_hz is not None
-                    else None
+                    round(movement_rate_hz, 3) if movement_rate_hz is not None else None
                 ),
                 "rest_rate_hz": (
-                    round(rest_rate_hz, 3)
-                    if rest_rate_hz is not None
-                    else None
+                    round(rest_rate_hz, 3) if rest_rate_hz is not None else None
                 ),
-
                 "movement_changed_count": movement_changed_count,
                 "movement_changed_fraction": round(movement_changed_fraction, 3),
                 "movement_only_value_count": len(movement_only_values),
                 "movement_only_values": sorted(movement_only_values)[:12],
-
                 "rest_summary": summarize_data_values(rest_frames),
                 "movement_summary": summarize_data_values(movement_frames),
             }
@@ -2261,8 +2239,7 @@ def recognize_drive_response_candidates(
     )
 
     useful_candidates = [
-        candidate for candidate in candidates
-        if candidate["score"] > 0
+        candidate for candidate in candidates if candidate["score"] > 0
     ]
 
     if useful_candidates:
@@ -2282,13 +2259,12 @@ def recognize_drive_response_candidates(
         "summary": summary,
         "source_step": source_step,
         "joystick_can_id": (
-            f"0x{joystick_can_id:08X}"
-            if joystick_can_id is not None
-            else None
+            f"0x{joystick_can_id:08X}" if joystick_can_id is not None else None
         ),
         "movement_windows": movement_windows,
         "ranked_candidates": useful_candidates[:max_candidates],
     }
+
 
 def summarize_top_drive_response_candidates(
     drive_response: dict[str, Any] | None,
@@ -2321,9 +2297,7 @@ def summarize_top_drive_response_candidates(
         if changed_fraction is None:
             parts.append(f"{can_id} score={score}")
         else:
-            parts.append(
-                f"{can_id} score={score}, changed={changed_fraction}"
-            )
+            parts.append(f"{can_id} score={score}, changed={changed_fraction}")
 
     extra_count = len(candidates) - len(top)
 
@@ -2335,6 +2309,7 @@ def summarize_top_drive_response_candidates(
     note += "."
 
     return note
+
 
 def recognize_step(
     step_key: str,
@@ -2362,13 +2337,13 @@ def recognize_step(
 
     if step_key == "right_indicator":
         return recognize_right_indicator(lines)
-    
+
     if step_key == "flood_headlight":
         return recognize_flood_headlight(lines)
 
     if step_key == "joystick_calibration":
         return recognize_joystick_calibration(lines)
-    
+
     if step_key == "joystick_forward":
         return recognize_joystick_forward(
             lines,
@@ -2392,7 +2367,7 @@ def recognize_step(
             lines,
             known_joystick_can_id=known_joystick_can_id,
         )
-    
+
     return {
         "recognizer": None,
         "implemented": False,
@@ -2401,14 +2376,18 @@ def recognize_step(
         "line_count": len(lines),
     }
 
+
 def print_recognition_summary(recognition: dict[str, Any]) -> None:
     print()
     print("Recognition:")
     print("  status:  %s" % recognition.get("status", "unknown"))
     print("  summary: %s" % recognition.get("summary", "No summary."))
+
+
 # -----------------------------------------------------------------------------
 # Helper functions
 # -----------------------------------------------------------------------------
+
 
 def slugify(text: str) -> str:
     """Turn a step name / label into a safe folder or filename component."""
@@ -2420,7 +2399,10 @@ def slugify(text: str) -> str:
     text = re.sub(r"_+", "_", text)
     return text.strip("_") or "unnamed"
 
-def resolve_runtime_path(files_root: Path, path_value: str | Path | None) -> Path | None:
+
+def resolve_runtime_path(
+    files_root: Path, path_value: str | Path | None
+) -> Path | None:
     """
     Resolve user/runtime paths under the meet-greet files root.
 
@@ -2467,6 +2449,7 @@ def build_listening_session_path(
     ts = utc_timestamp_for_filename()
     safe_label = slugify(label)
     return step_dir / f"{ts}_{safe_label}{suffix}"
+
 
 def load_saved_snippet_for_step(
     replay_root: Path,
@@ -2533,9 +2516,7 @@ def load_saved_snippet_for_step(
     #   # step: horn
     #   # label: candidate
     lines = [
-        line
-        for line in raw_lines
-        if line.strip() and not line.lstrip().startswith("#")
+        line for line in raw_lines if line.strip() and not line.lstrip().startswith("#")
     ]
 
     print(f"Loaded replay snippet: {chosen}")
@@ -2567,6 +2548,7 @@ def write_listening_session(
 
     return path
 
+
 def collect_listening_lines_for_step(step_name: str, seconds: float) -> list[str]:
     """
     TODO: Replace this with real CAN collection.
@@ -2590,12 +2572,17 @@ def format_can_message(msg, interface: str = "can0") -> str:
     Example:
       (1783377282.654466) can0 02000200#0000
     """
-    arbitration_id = f"{msg.arbitration_id:08X}" if msg.is_extended_id else f"{msg.arbitration_id:03X}"
+    arbitration_id = (
+        f"{msg.arbitration_id:08X}"
+        if msg.is_extended_id
+        else f"{msg.arbitration_id:03X}"
+    )
     data = msg.data.hex().upper()
     timestamp = getattr(msg, "timestamp", None)
     if timestamp is None:
         timestamp = datetime.now(timezone.utc).timestamp()
     return f"({timestamp:.6f}) {interface} {arbitration_id}#{data}"
+
 
 def ask_user_for_step_result() -> str:
     """Ask how to label the listening window."""
@@ -2620,8 +2607,14 @@ def ask_user_for_step_result() -> str:
 
     return "unclear"
 
+
 def timestamp() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S local time") + " (" + utc_timestamp_for_filename() + " UTC)"
+    return (
+        time.strftime("%Y-%m-%d %H:%M:%S local time")
+        + " ("
+        + utc_timestamp_for_filename()
+        + " UTC)"
+    )
 
 
 def ask_choice(prompt: str, choices: set[str], default: str | None = None) -> str:
@@ -2677,6 +2670,7 @@ def run_step(
         known_joystick_can_id=known_joystick_can_id,
     )
 
+
 def run_live_step(
     step: WizardStep,
     log_root: Path,
@@ -2717,7 +2711,6 @@ def run_live_step(
 
     source_path = None
 
-
     lines = collect_listening_lines_for_step(
         step.key,
         seconds=listen_seconds,
@@ -2729,7 +2722,7 @@ def run_live_step(
         known_joystick_can_id=known_joystick_can_id,
     )
     print_recognition_summary(recognition)
-    
+
     label = ask_user_for_step_result()
 
     notes = f"title={step.title}; timeout_seconds={step.timeout_seconds}; source=live_or_stub"
@@ -2786,6 +2779,7 @@ def run_live_step(
         },
     )
 
+
 def run_replay_step(
     step: WizardStep,
     log_root: Path,
@@ -2837,14 +2831,10 @@ def run_replay_step(
         known_joystick_can_id=known_joystick_can_id,
     )
     print_recognition_summary(recognition)
-    
-    notes = (
-        f"title={step.title}; "
-        f"replay_source={source_path}; "
-        f"source=replay"
-    )
 
-    label="candidate"
+    notes = f"title={step.title}; " f"replay_source={source_path}; " f"source=replay"
+
+    label = "candidate"
 
     snippet_path = write_listening_session(
         log_root,
@@ -2865,7 +2855,7 @@ def run_replay_step(
             "source": "replay",
             "replay_source": str(source_path),
             "line_count": len(lines),
-            "recognition": recognition, 
+            "recognition": recognition,
         },
     )
 
@@ -2873,9 +2863,9 @@ def run_replay_step(
 def build_default_steps() -> list[WizardStep]:
     """Define the main meet-and-greet path."""
     drive_safety = (
-            "Use the slowest indoor profile, open space, and a spotter. Release the "
-            "joystick immediately if anything feels wrong."
-        )
+        "Use the slowest indoor profile, open space, and a spotter. Release the "
+        "joystick immediately if anything feels wrong."
+    )
     steps = [
         WizardStep(
             key="baseline_idle",
@@ -3049,14 +3039,14 @@ def parse_args() -> argparse.Namespace:
         "--log-snippet-root",
         default=LOG_SNIPPET_ROOT_DEFAULT,
         help=f"Directory where per-step listening snippets are written "
-            f"(default: {LOG_SNIPPET_ROOT_DEFAULT})",
+        f"(default: {LOG_SNIPPET_ROOT_DEFAULT})",
     )
     p.add_argument(
         "--listen-seconds",
         type=float,
         default=LISTEN_SECONDS_DEFAULT,
         help=f"Seconds to listen for each interactive step "
-            f"(default: {LISTEN_SECONDS_DEFAULT})",
+        f"(default: {LISTEN_SECONDS_DEFAULT})",
     )
     p.add_argument(
         "--replay-log-root",
