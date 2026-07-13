@@ -59,6 +59,8 @@ import json
 import re
 import sys
 import time
+import can
+
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -656,17 +658,30 @@ def update_profile_from_step_result(
 # Future expectation / recognition stubs
 # -----------------------------------------------------------------------------
 
-# def open_can_bus(interface: str, bustype: str):
-#     """Future: open python-can bus in receive-only/passive mode."""
-#     pass
+def open_can_bus(interface: str, bustype: str):
+    """Open a python-can bus for passive receive-only logging."""
+    if can is None:
+        raise RuntimeError(
+            "python-can is not installed. Install it with: pip install python-can"
+        )
 
-# def close_can_bus(bus) -> None:
-#     """Future: cleanly close CAN bus."""
-#     pass
+    try:
+        # python-can 4.2+ prefers the keyword name `interface` over `bustype`.
+        return can.interface.Bus(channel=interface, interface=bustype)
+    except TypeError:
+        # Compatibility fallback for older python-can versions.
+        return can.interface.Bus(channel=interface, bustype=bustype)
 
-# def collect_action_window(bus, duration_seconds: float) -> list:
-#     """Future: collect frames while the user performs the requested action."""
-#     pass
+
+def close_can_bus(bus) -> None:
+    """Cleanly close a python-can bus if one was opened."""
+    if bus is None:
+        return
+
+    shutdown = getattr(bus, "shutdown", None)
+    if callable(shutdown):
+        shutdown()
+
 
 # def confirm_candidate_by_repetition(candidate: dict, repeated_action_frames: list) -> bool:
 #     """Future: confirm that a candidate repeats on a second/third trial."""
@@ -2655,20 +2670,53 @@ def write_listening_session(
     return path
 
 
-def collect_listening_lines_for_step(step_name: str, seconds: float) -> list[str]:
-    """
-    TODO: Replace this with real CAN collection.
+def collect_listening_lines_for_step(
+    step_name: str,
+    seconds: float,
+    *,
+    bus=None,
+    interface: str = "can0",
+) -> list[str]:
+    """Collect live CAN frames for one meet-and-greet step.
 
-    Future behavior:
-      - open python-can bus or use existing bus
-      - collect frames for `seconds`
-      - format each as candump-style text:
-          (timestamp) can0 ID#DATA
-      - return list[str]
+    Returns candump-style text lines such as:
+      (1783377282.654466) can0 02000200#0000
+
+    The function only receives frames. It does not transmit anything.
     """
-    print(f"[TODO] Listening for {seconds:.1f}s for step: {step_name}")
-    print("[TODO] Real CAN collection will go here later.")
-    return []
+    if bus is None:
+        print(f"[DRY/STUB] No CAN bus open for step: {step_name}")
+        print("[DRY/STUB] Returning an empty listening window.")
+        return []
+
+    lines: list[str] = []
+    end_time = time.monotonic() + seconds
+
+    print(f"Listening on {interface} for {seconds:.1f}s for step: {step_name}")
+
+    while True:
+        remaining = end_time - time.monotonic()
+        if remaining <= 0:
+            break
+
+        msg = bus.recv(timeout=min(0.25, remaining))
+
+        if msg is not None:
+            lines.append(format_can_message(msg, interface=interface))
+
+        sys.stdout.write(
+            "\rListening... %4.1fs remaining, %d frame(s) captured"
+            % (max(0.0, remaining), len(lines))
+        )
+        sys.stdout.flush()
+
+    sys.stdout.write(
+        "\rListening... done. %d frame(s) captured.          \n"
+        % len(lines)
+    )
+    sys.stdout.flush()
+
+    return lines
 
 
 def format_can_message(msg, interface: str = "can0") -> str:
@@ -2754,11 +2802,13 @@ def wait_countdown(seconds: float, *, label: str = "Listening") -> None:
 def run_step(
     step: WizardStep,
     log_root: Path,
-    listen_seconds: float,
+    listen_seconds: float | None,
     *,
     replay_root: Path | None = None,
     replay_pick: str = "ask",
     known_joystick_can_id: int | None = None,
+    bus=None,
+    interface: str = "can0",
 ) -> StepResult:
     if replay_root is not None:
         return run_replay_step(
@@ -2774,15 +2824,19 @@ def run_step(
         log_root,
         listen_seconds,
         known_joystick_can_id=known_joystick_can_id,
+        bus=bus,
+        interface=interface,
     )
 
 
 def run_live_step(
     step: WizardStep,
     log_root: Path,
-    listen_seconds: float,
+    listen_seconds: float | None,
     *,
     known_joystick_can_id: int | None = None,
+    bus=None,
+    interface: str = "can0",
 ) -> StepResult:
     """Run one skippable wizard step with a timeout placeholder."""
     print("\n" + "=" * 78)
@@ -2817,9 +2871,13 @@ def run_live_step(
 
     source_path = None
 
+    seconds = step.timeout_seconds if listen_seconds is None or listen_seconds <= 0 else listen_seconds
+
     lines = collect_listening_lines_for_step(
         step.key,
-        seconds=listen_seconds,
+        seconds=seconds,
+        bus=bus,
+        interface=interface,
     )
 
     recognition = recognize_step(
@@ -2831,7 +2889,7 @@ def run_live_step(
 
     label = ask_user_for_step_result()
 
-    notes = f"title={step.title}; timeout_seconds={step.timeout_seconds}; source=live_or_stub"
+    notes = f"title={step.title}; timeout_seconds={seconds}; source=live_can"
 
     snippet_path = write_listening_session(
         log_root,
@@ -2851,6 +2909,8 @@ def run_live_step(
             log_root,
             listen_seconds,
             known_joystick_can_id=known_joystick_can_id,
+            bus=bus,
+            interface=interface,
         )
     if label == "skipped":
         return StepResult(
@@ -3102,8 +3162,8 @@ def build_profile(args: argparse.Namespace) -> MeetGreetProfile:
         bustype=args.bustype,
         passive_only=True,
         safety_notes=[
-            "Skeleton only; no CAN recognition implemented.",
-            "Passive design target: do not transmit unless a future explicit confirm mode is added.",
+            "Passive listener: receives CAN frames only and does not transmit.",
+            "Do not add transmit behavior unless a future explicit confirm mode is added.",
             "Do not test drive movement without open space and a spotter.",
         ],
     )
@@ -3150,9 +3210,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--listen-seconds",
         type=float,
-        default=LISTEN_SECONDS_DEFAULT,
-        help=f"Seconds to listen for each interactive step "
-        f"(default: {LISTEN_SECONDS_DEFAULT})",
+        default=None,
+        help=(
+            "Override seconds to listen for every interactive step. "
+            "By default, each step uses its own timeout."
+        ),
     )
     p.add_argument(
         "--replay-log-root",
@@ -3176,6 +3238,14 @@ def parse_args() -> argparse.Namespace:
             f"(default: {MEET_GREET_FILES_ROOT_DEFAULT})"
         ),
     )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Run the interactive flow without opening CAN. Live steps return empty "
+            "captures. Replay mode does not need this."
+        ),
+    )
     return p.parse_args()
 
 
@@ -3193,16 +3263,29 @@ def main() -> int:
     profile = build_profile(args)
     steps = build_default_steps()
 
-    print("R-Net Meet & Greet skeleton")
-    print("This version does not read CAN yet. It only exercises the user-guided flow.")
+    print("R-Net Meet & Greet")
+    print("Passive listener: receives CAN frames only; does not transmit.")
     print("Files root: %s" % files_root)
     print("Output profile: %s" % output_path)
     print("Log snippets: %s" % log_root)
     print()
+
+    bus = None
     if replay_root is not None:
         print(f"Replay mode: reading snippets from {replay_root}")
+    elif args.dry_run:
+        print("Dry-run live mode: no CAN bus will be opened; captures will be empty.")
     else:
-        print("Live/stub mode: collecting from current listener")
+        print(f"Live mode: opening {args.interface} using python-can interface={args.bustype}")
+        try:
+            bus = open_can_bus(args.interface, args.bustype)
+        except (OSError, RuntimeError) as exc:
+            sys.stderr.write(f"Could not open {args.interface}: {exc}\n")
+            sys.stderr.write(
+                "Use --replay-log-root for replay mode, or --dry-run to exercise "
+                "the flow without CAN.\n"
+            )
+            return 1
 
     try:
         for step in steps:
@@ -3215,6 +3298,8 @@ def main() -> int:
                 replay_root=replay_root,
                 replay_pick=args.replay_pick,
                 known_joystick_can_id=known_joystick_can_id,
+                bus=bus,
+                interface=args.interface,
             )
 
             profile.steps[result.key] = result
@@ -3222,14 +3307,16 @@ def main() -> int:
 
             save_json_profile(profile, output_path)
     except KeyboardInterrupt:
-        print("\nWizard interrupted. Saving partial placeholder profile...")
+        print("\nWizard interrupted. Saving partial profile...")
         save_json_profile(profile, output_path)
         print_summary(profile)
         return 130
+    finally:
+        close_can_bus(bus)
 
     save_json_profile(profile, output_path)
     print_summary(profile)
-    print("Saved placeholder profile to: %s" % output_path)
+    print("Saved profile to: %s" % output_path)
     return 0
 
 
