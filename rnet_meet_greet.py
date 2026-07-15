@@ -60,6 +60,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import select
 import sys
 import time
 
@@ -2703,6 +2704,7 @@ def write_custom_log_session(
     interface: str,
     bustype: str,
     seconds: float,
+    stop_reason: str,
 ) -> Path:
     path = build_custom_log_path(
         root,
@@ -2718,6 +2720,7 @@ def write_custom_log_session(
         f.write(f"# interface: {interface}\n")
         f.write(f"# bustype: {bustype}\n")
         f.write(f"# listen_seconds: {seconds}\n")
+        f.write(f"# stop_reason: {stop_reason}\n")
         f.write(f"# line_count: {len(lines)}\n")
 
         if comments:
@@ -2741,27 +2744,45 @@ def collect_listening_lines_for_step(
     *,
     bus=None,
     interface: str = "can0",
-) -> list[str]:
+    allow_enter_to_stop: bool = False,
+    return_stop_reason: bool = False,
+) -> list[str] | tuple[list[str], str]:
     """Collect live CAN frames for one meet-and-greet step.
 
     Returns candump-style text lines such as:
       (1783377282.654466) can0 02000200#0000
 
     The function only receives frames. It does not transmit anything.
+
+    If allow_enter_to_stop is True, pressing Enter ends listening early.
+    If return_stop_reason is True, returns (lines, stop_reason), where
+    stop_reason is "timeout", "user_interrupted", or "no_bus".
     """
     if bus is None:
         print(f"[DRY/STUB] No CAN bus open for step: {step_name}")
         print("[DRY/STUB] Returning an empty listening window.")
+
+        if return_stop_reason:
+            return [], "no_bus"
+
         return []
 
     lines: list[str] = []
     end_time = time.monotonic() + seconds
+    stop_reason = "timeout"
 
     print(f"Listening on {interface} for {seconds:.1f}s for step: {step_name}")
+    if allow_enter_to_stop:
+        print("Press Enter to stop listening early.")
 
     while True:
         remaining = end_time - time.monotonic()
         if remaining <= 0:
+            stop_reason = "timeout"
+            break
+
+        if allow_enter_to_stop and stdin_enter_pressed():
+            stop_reason = "user_interrupted"
             break
 
         msg = bus.recv(timeout=min(0.25, remaining))
@@ -2769,17 +2790,34 @@ def collect_listening_lines_for_step(
         if msg is not None:
             lines.append(format_can_message(msg, interface=interface))
 
-        sys.stdout.write(
-            "\rListening... %4.1fs remaining, %d frame(s) captured"
-            % (max(0.0, remaining), len(lines))
-        )
+        if allow_enter_to_stop:
+            sys.stdout.write(
+                "\rListening... %4.1fs remaining, %d frame(s) captured; Enter=stop"
+                % (max(0.0, remaining), len(lines))
+            )
+        else:
+            sys.stdout.write(
+                "\rListening... %4.1fs remaining, %d frame(s) captured"
+                % (max(0.0, remaining), len(lines))
+            )
+
         sys.stdout.flush()
 
-    sys.stdout.write(
-        "\rListening... done. %d frame(s) captured.          \n"
-        % len(lines)
-    )
+    if stop_reason == "user_interrupted":
+        sys.stdout.write(
+            "\rListening... stopped early. %d frame(s) captured.          \n"
+            % len(lines)
+        )
+    else:
+        sys.stdout.write(
+            "\rListening... done. %d frame(s) captured.          \n"
+            % len(lines)
+        )
+
     sys.stdout.flush()
+
+    if return_stop_reason:
+        return lines, stop_reason
 
     return lines
 
@@ -2849,6 +2887,27 @@ def ask_choice(prompt: str, choices: set[str], default: str | None = None) -> st
             return raw
         print("Please enter one of: %s" % ", ".join(sorted(choices)))
 
+
+def stdin_enter_pressed() -> bool:
+    """
+    Return True if the user pressed Enter.
+
+    Intended for Linux/RPi/Docker terminals. If stdin is not selectable,
+    return False rather than breaking listening.
+    """
+    try:
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+    except (OSError, ValueError):
+        return False
+
+    if not readable:
+        return False
+
+    # Consume the Enter line so it does not affect the next input() prompt.
+    sys.stdin.readline()
+    return True
+
+
 def ask_listen_seconds_for_retry(default_seconds: float) -> float:
     """Ask for a custom listening timeout before retrying a custom log."""
     while True:
@@ -2896,6 +2955,25 @@ def ask_multiline_comments() -> str:
         lines.append(raw)
 
     return "\n".join(lines).strip()
+
+def stdin_enter_pressed() -> bool:
+    """
+    Return True if the user pressed Enter.
+
+    This is intended for Linux/macOS terminals. It should also work inside
+    a normal Linux Docker/RPi shell. If stdin is not selectable, return False.
+    """
+    try:
+        readable, _, _ = select.select([sys.stdin], [], [], 0)
+    except (OSError, ValueError):
+        return False
+
+    if not readable:
+        return False
+
+    # Consume the line so it does not affect the next input() prompt.
+    sys.stdin.readline()
+    return True
 
 
 def wait_countdown(seconds: float, *, label: str = "Listening") -> None:
@@ -3095,15 +3173,17 @@ def run_custom_log_mode(
     if choice == "q":
         raise KeyboardInterrupt
 
-    lines = collect_listening_lines_for_step(
+    lines, stop_reason = collect_listening_lines_for_step(
         f"custom:{title}",
         seconds=listen_seconds,
         bus=bus,
         interface=interface,
+        allow_enter_to_stop=True,
+        return_stop_reason=True,
     )
 
     print()
-    print(f"Captured {len(lines)} line(s).")
+    print(f"Captured {len(lines)} line(s). Stop reason: {stop_reason}.")
     label = ask_user_for_step_result()
 
     if label == "quit":
@@ -3132,6 +3212,7 @@ def run_custom_log_mode(
         interface=interface,
         bustype=bustype,
         seconds=listen_seconds,
+        stop_reason=stop_reason,
     )
 
     print(f"Saved custom log: {path}")
