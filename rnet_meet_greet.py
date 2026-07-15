@@ -3337,6 +3337,339 @@ def save_json_profile(profile: MeetGreetProfile, output_path: Path) -> None:
     output_path.write_text(json.dumps(serializable, indent=2), encoding="utf-8")
 
 
+def default_summary_output_path(output_path: Path) -> Path:
+    """Derive the human-readable summary path from the JSON output path."""
+    if output_path.suffix.lower() == ".json":
+        return output_path.with_name(f"{output_path.stem}_summary.md")
+    return output_path.with_name(f"{output_path.name}_summary.md")
+
+
+def plain_step_dict(profile_dict: dict[str, Any], key: str) -> dict[str, Any]:
+    steps = profile_dict.get("steps") or {}
+    step = steps.get(key) or {}
+    return step if isinstance(step, dict) else {}
+
+
+def step_recognition(profile_dict: dict[str, Any], key: str) -> dict[str, Any]:
+    step = plain_step_dict(profile_dict, key)
+    observations = step.get("observations") or {}
+    recognition = observations.get("recognition") or {}
+    return recognition if isinstance(recognition, dict) else {}
+
+
+def md_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    text = str(value)
+    text = text.replace("|", "\\|")
+    text = text.replace("\n", "<br>")
+    return text
+
+
+def md_table(headers: list[str], rows: list[list[Any]]) -> str:
+    if not rows:
+        return "_None found yet._\n"
+
+    out = []
+    out.append("| " + " | ".join(headers) + " |")
+    out.append("| " + " | ".join(["---"] * len(headers)) + " |")
+    for row in rows:
+        padded = row + [""] * (len(headers) - len(row))
+        out.append("| " + " | ".join(md_cell(value) for value in padded[: len(headers)]) + " |")
+    return "\n".join(out) + "\n"
+
+
+def format_optional_can_id(value: Any) -> str:
+    parsed = parse_can_id_value(value)
+    if parsed is not None:
+        return f"0x{parsed:08X}"
+    if value in (None, ""):
+        return ""
+    return str(value)
+
+
+def format_range(direction_range: dict[str, Any] | None) -> str:
+    if not direction_range:
+        return ""
+    axis = direction_range.get("axis")
+    sign = direction_range.get("sign")
+    peak = direction_range.get("signed_peak_from_center")
+    abs_peak = direction_range.get("primary_abs_peak")
+    delta_min = direction_range.get("primary_delta_min")
+    delta_max = direction_range.get("primary_delta_max")
+    off_axis = direction_range.get("off_axis")
+    off_axis_peak = direction_range.get("off_axis_abs_peak")
+
+    parts = []
+    if axis is not None:
+        parts.append(f"axis={axis}")
+    if sign is not None:
+        parts.append(f"sign={sign}")
+    if peak is not None:
+        parts.append(f"peak={peak}")
+    if abs_peak is not None:
+        parts.append(f"abs_peak={abs_peak}")
+    if delta_min is not None or delta_max is not None:
+        parts.append(f"range={delta_min}..{delta_max}")
+    if off_axis is not None and off_axis_peak is not None:
+        parts.append(f"off_axis_{off_axis}_peak={off_axis_peak}")
+    return ", ".join(parts)
+
+
+def collect_confirmed_ids(profile_dict: dict[str, Any]) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    confirmed = profile_dict.get("confirmed") or {}
+
+    joystick_id = confirmed.get("joystick_can_id") or confirmed.get("joystick_can_id_int")
+    if joystick_id is not None:
+        center = confirmed.get("joystick_center") or {}
+        rows.append([
+            "Drive joystick command",
+            format_optional_can_id(joystick_id),
+            "confirmed",
+            f"center X={center.get('x', '')}, Y={center.get('y', '')}",
+        ])
+
+    horn = step_recognition(profile_dict, "horn")
+    if horn:
+        joystick_ev = horn.get("joystick_evidence") or {}
+        programmer_ev = horn.get("programmer_evidence") or {}
+        if joystick_ev.get("pair_count", 0) or joystick_ev.get("start_count", 0) or joystick_ev.get("stop_count", 0):
+            rows.append([
+                "Horn start/stop, joystick",
+                f"{joystick_ev.get('start_id', '')} -> {joystick_ev.get('stop_id', '')}",
+                horn.get("status"),
+                f"pairs={joystick_ev.get('pair_count', 0)}, starts={joystick_ev.get('start_count', 0)}, stops={joystick_ev.get('stop_count', 0)}",
+            ])
+        if programmer_ev.get("pair_count", 0) or programmer_ev.get("start_count", 0) or programmer_ev.get("stop_count", 0):
+            rows.append([
+                "Horn start/stop, programmer",
+                f"{programmer_ev.get('start_id', '')} -> {programmer_ev.get('stop_id', '')}",
+                horn.get("status"),
+                f"pairs={programmer_ev.get('pair_count', 0)}, starts={programmer_ev.get('start_count', 0)}, stops={programmer_ev.get('stop_count', 0)}",
+            ])
+
+    light_steps = [
+        ("left_indicator", "Left indicator"),
+        ("right_indicator", "Right indicator"),
+        ("hazard", "Hazard lights"),
+        ("flood_headlight", "Flood/headlight"),
+    ]
+    for step_key, label in light_steps:
+        recog = step_recognition(profile_dict, step_key)
+        if not recog:
+            continue
+        physical_id = recog.get("expected_physical_toggle_id")
+        physical_count = recog.get("physical_toggle_count", 0)
+        status_bit = recog.get("status_bit") or recog.get("hazard_status_bit")
+        status_count = recog.get("status_event_count", 0)
+        programmer_count = recog.get("programmer_toggle_count", 0)
+        if physical_id or physical_count or status_count or programmer_count:
+            rows.append([
+                label,
+                physical_id,
+                recog.get("status"),
+                f"physical_toggles={physical_count}, programmer={programmer_count}, status_bit={status_bit}, status_events={status_count}",
+            ])
+
+    return rows
+
+
+def collect_joystick_range_rows(profile_dict: dict[str, Any]) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    confirmed = profile_dict.get("confirmed") or {}
+    mapping = confirmed.get("joystick_mapping") or {}
+
+    for direction in ["forward", "reverse", "left", "right"]:
+        info = mapping.get(direction) or {}
+        phase = info.get("phase") or {}
+        if info:
+            rows.append([
+                f"{direction} (calibration)",
+                confirmed.get("joystick_can_id"),
+                info.get("axis"),
+                info.get("sign"),
+                phase.get("signed_peak"),
+                max(phase.get("max_abs_dx", 0) or 0, phase.get("max_abs_dy", 0) or 0),
+                f"X {phase.get('x_min', '')}..{phase.get('x_max', '')}; Y {phase.get('y_min', '')}..{phase.get('y_max', '')}",
+            ])
+
+    for direction in ["forward", "reverse", "left", "right"]:
+        step_key = f"joystick_{direction}"
+        recog = step_recognition(profile_dict, step_key)
+        best = recog.get("best_candidate") or {}
+        direction_range = best.get("direction_range") or {}
+        if not direction_range:
+            continue
+        rows.append([
+            f"{direction} (range test)",
+            best.get("can_id"),
+            direction_range.get("axis"),
+            direction_range.get("sign"),
+            direction_range.get("signed_peak_from_center"),
+            direction_range.get("primary_abs_peak"),
+            format_range(direction_range),
+        ])
+
+    return rows
+
+
+def collect_drive_response_rows(profile_dict: dict[str, Any], limit_per_step: int = 3) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for step_key in [
+        "joystick_calibration",
+        "joystick_forward",
+        "joystick_reverse",
+        "joystick_left",
+        "joystick_right",
+    ]:
+        recog = step_recognition(profile_dict, step_key)
+        best = recog.get("best_candidate") or {}
+        drive_response = best.get("drive_response_candidates") or {}
+        for candidate in (drive_response.get("ranked_candidates") or [])[:limit_per_step]:
+            movement_summary = candidate.get("movement_summary") or {}
+            common_values = movement_summary.get("most_common_values") or []
+            common_text = ", ".join(
+                f"{item.get('data_hex')} x{item.get('count')}"
+                for item in common_values[:3]
+            )
+            rows.append([
+                step_key,
+                candidate.get("can_id"),
+                candidate.get("score"),
+                candidate.get("movement_changed_fraction"),
+                candidate.get("movement_frame_count"),
+                common_text,
+            ])
+    return rows
+
+
+def collect_step_summary_rows(profile_dict: dict[str, Any]) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    for key, step in (profile_dict.get("steps") or {}).items():
+        observations = step.get("observations") or {}
+        recognition = observations.get("recognition") or {}
+        rows.append([
+            key,
+            step.get("status"),
+            step.get("title"),
+            recognition.get("summary") or "; ".join(step.get("notes") or []),
+        ])
+    return rows
+
+
+def write_human_summary(profile: MeetGreetProfile, summary_path: Path) -> None:
+    """Write a human-readable Markdown summary next to the JSON profile."""
+    profile_dict = asdict(profile)
+    confirmed = profile_dict.get("confirmed") or {}
+
+    lines: list[str] = []
+    lines.append(f"# R-Net meet-and-greet summary: {profile.profile_name}")
+    lines.append("")
+    lines.append("This is a human-readable companion to the JSON profile. It is meant for quick chair-to-chair comparison, not as a complete raw-data archive.")
+    lines.append("")
+    lines.append("## Session")
+    lines.append("")
+    lines.append(md_table(
+        ["Field", "Value"],
+        [
+            ["Profile name", profile.profile_name],
+            ["Created", profile.created_at],
+            ["Interface", profile.interface],
+            ["python-can interface", profile.bustype],
+            ["Passive only", profile.passive_only],
+            ["Confirmed joystick ID", format_optional_can_id(confirmed.get("joystick_can_id") or confirmed.get("joystick_can_id_int"))],
+            ["Joystick center", confirmed.get("joystick_center")],
+        ],
+    ))
+
+    lines.append("## At-a-glance IDs")
+    lines.append("")
+    lines.append(md_table(
+        ["Item", "CAN ID / IDs", "Status", "Evidence"],
+        collect_confirmed_ids(profile_dict),
+    ))
+
+    baseline = step_recognition(profile_dict, "baseline")
+    if baseline:
+        lines.append("## Baseline bus traffic")
+        lines.append("")
+        lines.append(baseline.get("summary", ""))
+        lines.append("")
+        top_rows = []
+        for item in baseline.get("top_ids") or []:
+            top_rows.append([
+                item.get("can_id"),
+                item.get("count"),
+                item.get("approx_rate_hz"),
+            ])
+        lines.append(md_table(["CAN ID", "Count", "Approx Hz"], top_rows))
+
+        idle = baseline.get("joystick_idle_inference") or {}
+        idle_rows = []
+        for candidate in (idle.get("ranked_candidates") or [])[:6]:
+            idle_rows.append([
+                candidate.get("can_id"),
+                candidate.get("score"),
+                candidate.get("rate_hz"),
+                candidate.get("zero_fraction"),
+                candidate.get("rnet_joystick_family"),
+            ])
+        if idle_rows:
+            lines.append("### Joystick idle candidates")
+            lines.append("")
+            lines.append(md_table(
+                ["CAN ID", "Score", "Rate Hz", "Zero fraction", "R-Net joystick family"],
+                idle_rows,
+            ))
+
+    lines.append("## Joystick mapping and ranges")
+    lines.append("")
+    lines.append(md_table(
+        ["Direction", "CAN ID", "Axis", "Sign", "Signed peak", "Abs peak", "Range notes"],
+        collect_joystick_range_rows(profile_dict),
+    ))
+
+    lines.append("## Drive-response candidates")
+    lines.append("")
+    lines.append("These are non-joystick IDs that changed during joystick movement windows. Treat them as candidates, not confirmed control IDs.")
+    lines.append("")
+    lines.append(md_table(
+        ["Source step", "CAN ID", "Score", "Changed fraction", "Movement frames", "Common movement values"],
+        collect_drive_response_rows(profile_dict),
+    ))
+
+    lines.append("## Step-by-step recognizer summaries")
+    lines.append("")
+    lines.append(md_table(
+        ["Step", "Status", "Title", "Summary"],
+        collect_step_summary_rows(profile_dict),
+    ))
+
+    if profile.safety_notes:
+        lines.append("## Safety notes")
+        lines.append("")
+        for note in profile.safety_notes:
+            lines.append(f"- {note}")
+        lines.append("")
+
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def save_profile_outputs(
+    profile: MeetGreetProfile,
+    output_path: Path,
+    summary_path: Path | None,
+) -> None:
+    """Write JSON plus the optional human-readable summary."""
+    save_json_profile(profile, output_path)
+    if summary_path is not None:
+        write_human_summary(profile, summary_path)
+
+
 def print_summary(profile: MeetGreetProfile) -> None:
     print("\n" + "=" * 78)
     print("Meet & greet placeholder summary")
@@ -3362,6 +3695,15 @@ def parse_args() -> argparse.Namespace:
         "--output",
         default="rnet_meet_greet_profile.json",
         help="path for placeholder JSON profile output",
+    )
+    p.add_argument(
+        "--summary-output",
+        default=None,
+        help=(
+            "Path for human-readable Markdown summary output. "
+            "By default, this is derived from --output, e.g. "
+            "rnet_meet_greet_profile_summary.md"
+        ),
     )
     p.add_argument(
         "--log-snippet-root",
@@ -3432,6 +3774,10 @@ def main() -> int:
     files_root = Path(args.files_root)
     files_root.mkdir(parents=True, exist_ok=True)
     output_path = resolve_runtime_path(files_root, args.output)
+    if args.summary_output is None:
+        summary_output_path = default_summary_output_path(output_path)
+    else:
+        summary_output_path = resolve_runtime_path(files_root, args.summary_output)
     log_root = ensure_log_root(resolve_runtime_path(files_root, args.log_snippet_root))
     replay_root = resolve_runtime_path(files_root, args.replay_log_root)
     resolved_log_root = resolve_runtime_path(files_root, args.log_snippet_root)
@@ -3445,6 +3791,7 @@ def main() -> int:
     print("Passive listener: receives CAN frames only; does not transmit.")
     print("Files root: %s" % files_root)
     print("Output profile: %s" % output_path)
+    print("Human summary: %s" % summary_output_path)
     print("Log snippets: %s" % log_root)
     print()
 
@@ -3523,18 +3870,19 @@ def main() -> int:
             profile.steps[result.key] = result
             update_profile_from_step_result(profile, result)
 
-            save_json_profile(profile, output_path)
+            save_profile_outputs(profile, output_path, summary_output_path)
     except KeyboardInterrupt:
         print("\nWizard interrupted. Saving partial profile...")
-        save_json_profile(profile, output_path)
+        save_profile_outputs(profile, output_path, summary_output_path)
         print_summary(profile)
         return 130
     finally:
         close_can_bus(bus)
 
-    save_json_profile(profile, output_path)
+    save_profile_outputs(profile, output_path, summary_output_path)
     print_summary(profile)
     print("Saved profile to: %s" % output_path)
+    print("Saved human summary to: %s" % summary_output_path)
     return 0
 
 
