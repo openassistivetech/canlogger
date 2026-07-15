@@ -12,6 +12,9 @@ python3 rnet_meet_greet.py \
   --replay-log-root meet_greet_log_snippets \
   --replay-pick ask
 
+run with --custom-log in order to get manually tagged bit of interactive user sessions, like this:
+meet_greet_files/custom_logs/20260713T225501Z_programmer_horn_candidate.log
+  
 Future goals:
 1) multiple tests for range maximums for joystick inputs
 
@@ -59,8 +62,11 @@ import json
 import re
 import sys
 import time
-import can
 
+try:
+    import can
+except ImportError:  # pragma: no cover - handled at runtime for live mode
+    can = None
 from collections import Counter
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -75,6 +81,7 @@ LOG_SNIPPET_ROOT_DEFAULT = "meet_greet_log_snippets"
 LISTEN_SECONDS_DEFAULT = 10.0
 MEET_GREET_FILES_ROOT_DEFAULT = "meet_greet_files"
 JOYSTICK_DEADZONE_DEFAULT = 3
+CUSTOM_LOG_ROOT_DEFAULT = "custom_logs"
 
 # Known R-Net frame IDs
 HORN_START_ID = 0x0C040100
@@ -2555,6 +2562,22 @@ def ensure_step_log_dir(root: Path, step_name: str) -> Path:
     return step_dir
 
 
+def build_custom_log_path(
+    root: Path,
+    *,
+    title: str,
+    label: str,
+    suffix: str = ".log",
+) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+
+    ts = utc_timestamp_for_filename()
+    safe_title = slugify(title)
+    safe_label = slugify(label)
+
+    return root / f"{ts}_{safe_title}_{safe_label}{suffix}"
+
+
 def utc_timestamp_for_filename() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
@@ -2662,6 +2685,48 @@ def write_listening_session(
         f.write(f"# captured_utc: {datetime.now(timezone.utc).isoformat()}\n")
         if notes:
             f.write(f"# notes: {notes}\n")
+        f.write("\n")
+
+        for line in lines:
+            f.write(line.rstrip("\n") + "\n")
+
+    return path
+
+
+def write_custom_log_session(
+    root: Path,
+    *,
+    title: str,
+    label: str,
+    lines: list[str],
+    comments: str,
+    interface: str,
+    bustype: str,
+    seconds: float,
+) -> Path:
+    path = build_custom_log_path(
+        root,
+        title=title,
+        label=label,
+    )
+
+    with path.open("w", encoding="utf-8") as f:
+        f.write("# custom_log: true\n")
+        f.write(f"# title: {title}\n")
+        f.write(f"# label: {label}\n")
+        f.write(f"# captured_utc: {datetime.now(timezone.utc).isoformat()}\n")
+        f.write(f"# interface: {interface}\n")
+        f.write(f"# bustype: {bustype}\n")
+        f.write(f"# listen_seconds: {seconds}\n")
+        f.write(f"# line_count: {len(lines)}\n")
+
+        if comments:
+            f.write("# comments:\n")
+            for comment_line in comments.splitlines():
+                f.write(f"#   {comment_line}\n")
+        else:
+            f.write("# comments: \n")
+
         f.write("\n")
 
         for line in lines:
@@ -2783,6 +2848,31 @@ def ask_choice(prompt: str, choices: set[str], default: str | None = None) -> st
         if raw in choices:
             return raw
         print("Please enter one of: %s" % ", ".join(sorted(choices)))
+
+def ask_multiline_comments() -> str:
+    """
+    Ask the user for freeform notes.
+
+    Finish with a single dot on its own line.
+    """
+    print()
+    print("Enter manual comments / metadata for this custom log.")
+    print("Examples:")
+    print("  - what action you performed")
+    print("  - what buttons or programmer screens you used")
+    print("  - timing notes, surprises, physical result")
+    print("Finish with a single '.' on its own line.")
+    print()
+
+    lines: list[str] = []
+
+    while True:
+        raw = input("> ")
+        if raw.strip() == ".":
+            break
+        lines.append(raw)
+
+    return "\n".join(lines).strip()
 
 
 def wait_countdown(seconds: float, *, label: str = "Listening") -> None:
@@ -2944,6 +3034,78 @@ def run_live_step(
             "recognition": recognition,
         },
     )
+
+
+def run_custom_log_mode(
+    *,
+    custom_root: Path,
+    listen_seconds: float,
+    bus=None,
+    interface: str = "can0",
+    bustype: str = "socketcan",
+) -> Path:
+    print("\n" + "=" * 78)
+    print("Custom CAN log grab")
+    print("=" * 78)
+    print("This mode captures raw CAN traffic only.")
+    print("No recognizers will run and no profile step will be updated.")
+    print()
+
+    while True:
+        title = input("Title for this custom test: ").strip()
+        if title:
+            break
+        print("Please enter a short title, e.g. programmer horn or charger plugged in.")
+
+    print()
+    print("Prepare the action you want to capture.")
+    print("Options:")
+    print("  r = ready / start listening")
+    print("  q = quit")
+
+    choice = ask_choice("Choice", {"r", "q"}, default="r")
+    if choice == "q":
+        raise KeyboardInterrupt
+
+    lines = collect_listening_lines_for_step(
+        f"custom:{title}",
+        seconds=listen_seconds,
+        bus=bus,
+        interface=interface,
+    )
+
+    print()
+    print(f"Captured {len(lines)} line(s).")
+    label = ask_user_for_step_result()
+
+    if label == "quit":
+        raise KeyboardInterrupt
+
+    if label == "retry":
+        print("Retrying custom capture.")
+        return run_custom_log_mode(
+            custom_root=custom_root,
+            listen_seconds=listen_seconds,
+            bus=bus,
+            interface=interface,
+            bustype=bustype,
+        )
+
+    comments = ask_multiline_comments()
+
+    path = write_custom_log_session(
+        custom_root,
+        title=title,
+        label=label,
+        lines=lines,
+        comments=comments,
+        interface=interface,
+        bustype=bustype,
+        seconds=listen_seconds,
+    )
+
+    print(f"Saved custom log: {path}")
+    return path
 
 
 def run_replay_step(
@@ -3246,6 +3408,22 @@ def parse_args() -> argparse.Namespace:
             "captures. Replay mode does not need this."
         ),
     )
+    p.add_argument(
+        "--custom-log",
+        action="store_true",
+        help=(
+            "Run one freeform custom CAN log capture instead of the standard "
+            "meet-and-greet step sequence. No recognizers are run."
+        ),
+    )
+    p.add_argument(
+        "--custom-log-root",
+        default=CUSTOM_LOG_ROOT_DEFAULT,
+        help=(
+            "Directory for freeform custom logs, relative to --files-root unless absolute "
+            f"(default: {CUSTOM_LOG_ROOT_DEFAULT})"
+        ),
+    )
     return p.parse_args()
 
 
@@ -3287,6 +3465,46 @@ def main() -> int:
             )
             return 1
 
+    if args.custom_log:
+        if replay_root is not None:
+            sys.stderr.write("--custom-log is for live/dry-run captures, not replay mode.\n")
+            return 1
+
+        custom_root = resolve_runtime_path(files_root, args.custom_log_root)
+        assert custom_root is not None
+
+        seconds = (
+            args.listen_seconds
+            if args.listen_seconds is not None and args.listen_seconds > 0
+            else LISTEN_SECONDS_DEFAULT
+        )
+
+        try:
+            while True:
+                run_custom_log_mode(
+                    custom_root=custom_root,
+                    listen_seconds=seconds,
+                    bus=bus,
+                    interface=args.interface,
+                    bustype=args.bustype,
+                )
+
+                again = ask_choice(
+                    "Capture another custom log?",
+                    {"y", "n"},
+                    default="n",
+                )
+                if again != "y":
+                    break
+        except KeyboardInterrupt:
+            print("\nCustom log capture interrupted.")
+            return 130
+        finally:
+            close_can_bus(bus)
+
+        return 0
+    
+    # Run the main wizard steps if not in custom log mode
     try:
         for step in steps:
             known_joystick_can_id = get_confirmed_joystick_can_id(profile)
