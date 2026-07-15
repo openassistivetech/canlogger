@@ -2849,6 +2849,29 @@ def ask_choice(prompt: str, choices: set[str], default: str | None = None) -> st
             return raw
         print("Please enter one of: %s" % ", ".join(sorted(choices)))
 
+def ask_listen_seconds_for_retry(default_seconds: float) -> float:
+    """Ask for a custom listening timeout before retrying a custom log."""
+    while True:
+        raw = input(
+            f"Retry listen time in seconds [Enter={default_seconds:.1f}]: "
+        ).strip()
+
+        if not raw:
+            return default_seconds
+
+        try:
+            seconds = float(raw)
+        except ValueError:
+            print("Please enter a number, like 10, 20, or 45.")
+            continue
+
+        if seconds <= 0:
+            print("Please enter a positive number of seconds.")
+            continue
+
+        return seconds
+    
+
 def ask_multiline_comments() -> str:
     """
     Ask the user for freeform notes.
@@ -3043,6 +3066,7 @@ def run_custom_log_mode(
     bus=None,
     interface: str = "can0",
     bustype: str = "socketcan",
+    preset_title: str | None = None,
 ) -> Path:
     print("\n" + "=" * 78)
     print("Custom CAN log grab")
@@ -3051,11 +3075,15 @@ def run_custom_log_mode(
     print("No recognizers will run and no profile step will be updated.")
     print()
 
-    while True:
-        title = input("Title for this custom test: ").strip()
-        if title:
-            break
-        print("Please enter a short title, e.g. programmer horn or charger plugged in.")
+    if preset_title is not None:
+        title = preset_title
+        print(f"Retrying custom test: {title}")
+    else:
+        while True:
+            title = input("Title for this custom test: ").strip()
+            if title:
+                break
+            print("Please enter a short title, e.g. programmer horn or charger plugged in.")
 
     print()
     print("Prepare the action you want to capture.")
@@ -3082,13 +3110,15 @@ def run_custom_log_mode(
         raise KeyboardInterrupt
 
     if label == "retry":
-        print("Retrying custom capture.")
+        retry_seconds = ask_listen_seconds_for_retry(listen_seconds)
+        print(f"Retrying custom capture for {retry_seconds:.1f}s.")
         return run_custom_log_mode(
             custom_root=custom_root,
-            listen_seconds=listen_seconds,
+            listen_seconds=retry_seconds,
             bus=bus,
             interface=interface,
             bustype=bustype,
+            preset_title=title,
         )
 
     comments = ask_multiline_comments()
