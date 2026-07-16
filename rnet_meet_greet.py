@@ -691,6 +691,48 @@ def close_can_bus(bus) -> None:
         shutdown()
 
 
+def flush_can_rx_queue(
+    bus,
+    *,
+    max_seconds: float = 0.5,
+) -> dict[str, Any]:
+    """Drain already-buffered CAN frames before starting a capture window.
+
+    This is meant to remove messages that arrived while the script was sitting
+    at prompts between tests. It only receives and discards frames that are
+    already available from python-can/socketcan; it never transmits.
+
+    max_seconds is just a safety guard so a very busy bus cannot spin forever.
+    """
+    info: dict[str, Any] = {
+        "flushed_count": 0,
+        "oldest_timestamp": None,
+        "newest_timestamp": None,
+        "max_seconds": max_seconds,
+    }
+
+    if bus is None or max_seconds <= 0:
+        return info
+
+    deadline = time.monotonic() + max_seconds
+
+    while time.monotonic() < deadline:
+        # Non-blocking: return immediately if the current receive queue is empty.
+        msg = bus.recv(timeout=0.0)
+        if msg is None:
+            break
+
+        info["flushed_count"] += 1
+        timestamp = getattr(msg, "timestamp", None)
+
+        if timestamp is not None:
+            if info["oldest_timestamp"] is None:
+                info["oldest_timestamp"] = timestamp
+            info["newest_timestamp"] = timestamp
+
+    return info
+
+
 # def confirm_candidate_by_repetition(candidate: dict, repeated_action_frames: list) -> bool:
 #     """Future: confirm that a candidate repeats on a second/third trial."""
 #     pass
@@ -2766,6 +2808,14 @@ def collect_listening_lines_for_step(
             return [], "no_bus"
 
         return []
+
+    flush_info = flush_can_rx_queue(bus, max_seconds=0.5)
+    flushed_count = flush_info.get("flushed_count", 0)
+    if flushed_count:
+        print(
+            f"Flushed {flushed_count} queued frame(s) before capture "
+            f"(max {0.5:.2f}s)."
+        )
 
     lines: list[str] = []
     end_time = time.monotonic() + seconds
