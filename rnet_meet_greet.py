@@ -108,6 +108,52 @@ PROGRAMMER_LEFT_INDICATOR_TOGGLE_ID = 0x0C000F01
 PROGRAMMER_RIGHT_INDICATOR_TOGGLE_ID = 0x0C000F02
 PROGRAMMER_FLOOD_HEADLIGHT_TOGGLE_ID = 0x0C000F04
 
+# Seating frames
+SEATING_BLOCK_ID = 0x0C180300
+SEATING_BLOCK_START_DATA = "0202"
+SEATING_BLOCK_END_DATA = "0201"
+SEATING_FUNCTION_STATUS_ID = 0x0C180301
+
+SEATING_FUNCTION_SPECS: dict[str, dict[str, Any]] = {
+    # code: observed selected function and expected joystick polarity in seating mode
+    "20": {
+        "name": "elevate",
+        "display_name": "Elevate",
+        "more_state": "y_pos",
+        "less_state": "y_neg",
+        "more_label": "elevate more / raise",
+        "less_label": "elevate less / lower",
+    },
+    "21": {
+        "name": "recline",
+        "display_name": "Recline / backrest",
+        "more_state": "y_neg",
+        "less_state": "y_pos",
+        "more_label": "recline more / backrest back",
+        "less_label": "recline less / backrest forward",
+    },
+    "22": {
+        "name": "tilt",
+        "display_name": "Tilt",
+        "more_state": "y_neg",
+        "less_state": "y_pos",
+        "more_label": "tilt more",
+        "less_label": "tilt less",
+    },
+    "23": {
+        "name": "legs",
+        "display_name": "Legs",
+        "more_state": "y_pos",
+        "less_state": "y_neg",
+        "more_label": "legs more / raise legs",
+        "less_label": "legs less / lower legs",
+    },
+}
+
+SEATING_FUNCTION_NAME_TO_CODE = {
+    spec["name"]: code for code, spec in SEATING_FUNCTION_SPECS.items()
+}
+
 
 @dataclass
 class StepResult:
@@ -2554,6 +2600,504 @@ def summarize_top_drive_response_candidates(
     return note
 
 
+
+def parse_seating_status_blocks(lines: list[str]) -> list[dict[str, Any]]:
+    """
+    Parse passive seating/display status blocks.
+
+    Observed pattern for this chair/profile:
+      0C180300#0202          block start candidate
+      0C180301#220101        first function/status entry; often selected function
+      0C180301#300101        metadata/status
+      ...
+      0C180300#0201          block end candidate
+
+    This is passive evidence only. It is not a command map.
+    """
+    blocks: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    for line in lines:
+        frame = parse_can_log_line(line)
+        if frame is None:
+            continue
+
+        can_id = frame["can_id"]
+        data_hex = frame["data_hex"]
+
+        if can_id == SEATING_BLOCK_ID and data_hex == SEATING_BLOCK_START_DATA:
+            if current is not None:
+                current["complete"] = False
+                current["end_timestamp"] = None
+                current["end_line"] = None
+                _finalize_seating_status_block(current)
+                blocks.append(current)
+
+            current = {
+                "start_timestamp": frame["timestamp"],
+                "end_timestamp": None,
+                "duration_seconds": None,
+                "start_line": frame["raw"],
+                "end_line": None,
+                "complete": False,
+                "function_entries": [],
+                "selected_function_code": None,
+                "selected_function_name": None,
+                "selected_function_display_name": None,
+                "selected_function_line": None,
+            }
+            continue
+
+        if current is None:
+            continue
+
+        if can_id == SEATING_FUNCTION_STATUS_ID:
+            code = data_hex[:2].upper() if len(data_hex) >= 2 else None
+            spec = SEATING_FUNCTION_SPECS.get(code or "")
+            current["function_entries"].append(
+                {
+                    "timestamp": frame["timestamp"],
+                    "raw": frame["raw"],
+                    "data_hex": data_hex,
+                    "code": code,
+                    "known_function": spec is not None,
+                    "function_name": spec.get("name") if spec else None,
+                    "function_display_name": spec.get("display_name") if spec else None,
+                }
+            )
+            continue
+
+        if can_id == SEATING_BLOCK_ID and data_hex == SEATING_BLOCK_END_DATA:
+            current["complete"] = True
+            current["end_timestamp"] = frame["timestamp"]
+            current["end_line"] = frame["raw"]
+            current["duration_seconds"] = round(
+                frame["timestamp"] - current["start_timestamp"],
+                6,
+            )
+            _finalize_seating_status_block(current)
+            blocks.append(current)
+            current = None
+            continue
+
+    if current is not None:
+        current["complete"] = False
+        _finalize_seating_status_block(current)
+        blocks.append(current)
+
+    return blocks
+
+
+def _finalize_seating_status_block(block: dict[str, Any]) -> None:
+    entries = block.get("function_entries") or []
+    if not entries:
+        return
+
+    # Current best passive rule from Bumblebee logs:
+    # the first 0C180301 entry in a block is the selected seating function.
+    selected = entries[0]
+    code = selected.get("code")
+    spec = SEATING_FUNCTION_SPECS.get(code or "")
+
+    block["selected_function_code"] = code
+    block["selected_function_name"] = spec.get("name") if spec else None
+    block["selected_function_display_name"] = spec.get("display_name") if spec else None
+    block["selected_function_line"] = selected.get("raw")
+
+
+def summarize_seating_blocks(blocks: list[dict[str, Any]], limit: int = 12) -> list[dict[str, Any]]:
+    return [
+        {
+            "start_timestamp": block.get("start_timestamp"),
+            "end_timestamp": block.get("end_timestamp"),
+            "duration_seconds": block.get("duration_seconds"),
+            "complete": block.get("complete"),
+            "selected_function_code": block.get("selected_function_code"),
+            "selected_function_name": block.get("selected_function_name"),
+            "selected_function_display_name": block.get("selected_function_display_name"),
+            "selected_function_line": block.get("selected_function_line"),
+            "function_entry_count": len(block.get("function_entries") or []),
+            "function_entries": block.get("function_entries", [])[:8],
+            "start_line": block.get("start_line"),
+            "end_line": block.get("end_line"),
+        }
+        for block in blocks[:limit]
+    ]
+
+
+def latest_seating_block_before_or_during(
+    blocks: list[dict[str, Any]],
+    timestamp: float,
+) -> dict[str, Any] | None:
+    latest: dict[str, Any] | None = None
+
+    for block in blocks:
+        start = block.get("start_timestamp")
+        if start is None:
+            continue
+        if start <= timestamp:
+            latest = block
+        else:
+            break
+
+    return latest
+
+
+def choose_joystick_samples_for_seating_validation(
+    lines: list[str],
+    *,
+    known_joystick_can_id: int | None,
+) -> tuple[int | None, list[dict[str, Any]], str]:
+    samples = extract_two_byte_xy_samples(lines)
+    if not samples:
+        return None, [], "no_two_byte_samples"
+
+    samples_by_id: dict[int, list[dict[str, Any]]] = {}
+    for sample in samples:
+        samples_by_id.setdefault(sample["can_id"], []).append(sample)
+
+    if known_joystick_can_id is not None and known_joystick_can_id in samples_by_id:
+        return known_joystick_can_id, samples_by_id[known_joystick_can_id], "known_joystick_can_id"
+
+    # Fallback for custom/replay logs when a profile has not been loaded yet.
+    # Prefer 0x0200NN00 family streams with the most samples.
+    ranked_ids = sorted(
+        samples_by_id.keys(),
+        key=lambda can_id: (
+            looks_like_rnet_joystick_family(can_id),
+            len(samples_by_id[can_id]),
+        ),
+        reverse=True,
+    )
+
+    if not ranked_ids:
+        return None, [], "no_candidate_ids"
+
+    chosen = ranked_ids[0]
+    return chosen, samples_by_id[chosen], "fallback_highest_sample_joystick_like_id"
+
+
+def seating_motion_label_for_state(
+    state: str,
+    *,
+    expected_function_name: str,
+) -> str | None:
+    code = SEATING_FUNCTION_NAME_TO_CODE.get(expected_function_name)
+    if code is None:
+        return None
+
+    spec = SEATING_FUNCTION_SPECS[code]
+    if state == spec["more_state"]:
+        return "more"
+    if state == spec["less_state"]:
+        return "less"
+    return None
+
+
+def recognize_seating_option_validation(
+    lines: list[str],
+    *,
+    expected_function_name: str,
+    deadzone: int = JOYSTICK_DEADZONE_DEFAULT,
+    min_peak: int = 20,
+    known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    """
+    Validate one seating option using passive evidence.
+
+    Expected user pattern, for example tilt:
+      1. get the chair into tilt mode using normal controls
+      2. tilt more for a bit
+      3. center joystick
+      4. tilt less for a bit
+      5. center joystick
+
+    The recognizer checks:
+      - whether a selected-function block names the expected function
+      - whether joystick movement phases occur while that function is selected
+      - whether the first matching pair follows expected more -> less polarity
+      - whether there is a center phase between more and less
+
+    It never transmits. It only evaluates user-performed actions from logs.
+    """
+    expected_code = SEATING_FUNCTION_NAME_TO_CODE.get(expected_function_name)
+    if expected_code is None:
+        return {
+            "recognizer": f"seating_{expected_function_name}_validation",
+            "implemented": True,
+            "status": "failed",
+            "summary": f"Unknown seating function '{expected_function_name}'.",
+            "known_functions": sorted(SEATING_FUNCTION_NAME_TO_CODE.keys()),
+        }
+
+    spec = SEATING_FUNCTION_SPECS[expected_code]
+    blocks = parse_seating_status_blocks(lines)
+    expected_blocks = [
+        block for block in blocks
+        if block.get("selected_function_code") == expected_code
+    ]
+
+    joystick_can_id, joystick_samples, joystick_source = choose_joystick_samples_for_seating_validation(
+        lines,
+        known_joystick_can_id=known_joystick_can_id,
+    )
+
+    if not joystick_samples or joystick_can_id is None:
+        return {
+            "recognizer": f"seating_{expected_function_name}_validation",
+            "implemented": True,
+            "status": "timeout",
+            "summary": (
+                f"No joystick samples found while validating {spec['display_name']}. "
+                f"Selected-function block count={len(expected_blocks)}."
+            ),
+            "line_count": len(lines),
+            "expected_function_code": expected_code,
+            "expected_function_name": expected_function_name,
+            "expected_function_display_name": spec["display_name"],
+            "seating_blocks": summarize_seating_blocks(blocks),
+            "expected_function_blocks": summarize_seating_blocks(expected_blocks),
+            "joystick_source": joystick_source,
+        }
+
+    if known_joystick_center is not None:
+        center_x, center_y = known_joystick_center
+        center_source = "joystick_calibration"
+    else:
+        center_x, center_y = 0, 0
+        center_source = "default_zero_fallback"
+
+    phases = compress_joystick_motion_phases(
+        joystick_samples,
+        center_x=center_x,
+        center_y=center_y,
+        deadzone=deadzone,
+        min_phase_samples=2,
+    )
+
+    annotated_movement_phases: list[dict[str, Any]] = []
+
+    for phase_index, phase in enumerate(phases):
+        if phase.get("kind") != "movement":
+            continue
+
+        block = latest_seating_block_before_or_during(
+            blocks,
+            phase["start_timestamp"],
+        )
+        selected_code = block.get("selected_function_code") if block else None
+        selected_name = block.get("selected_function_name") if block else None
+        motion_label = None
+
+        if selected_code == expected_code:
+            motion_label = seating_motion_label_for_state(
+                phase.get("state"),
+                expected_function_name=expected_function_name,
+            )
+
+        annotated_movement_phases.append(
+            {
+                "phase_index": phase_index,
+                "kind": phase.get("kind"),
+                "state": phase.get("state"),
+                "axis": phase.get("axis"),
+                "sign": phase.get("sign"),
+                "signed_peak": phase.get("signed_peak"),
+                "max_abs_dx": phase.get("max_abs_dx"),
+                "max_abs_dy": phase.get("max_abs_dy"),
+                "sample_count": phase.get("sample_count"),
+                "duration_seconds": phase.get("duration_seconds"),
+                "start_timestamp": phase.get("start_timestamp"),
+                "end_timestamp": phase.get("end_timestamp"),
+                "x_min": phase.get("x_min"),
+                "x_max": phase.get("x_max"),
+                "y_min": phase.get("y_min"),
+                "y_max": phase.get("y_max"),
+                "selected_function_code_at_start": selected_code,
+                "selected_function_name_at_start": selected_name,
+                "selected_function_block_start": block.get("start_timestamp") if block else None,
+                "motion_label_for_expected_function": motion_label,
+                "example_lines": phase.get("example_lines"),
+            }
+        )
+
+    relevant = [
+        phase for phase in annotated_movement_phases
+        if phase.get("selected_function_code_at_start") == expected_code
+        and max(phase.get("max_abs_dx") or 0, phase.get("max_abs_dy") or 0) >= min_peak
+    ]
+
+    expected_axis_states = {
+        "more": spec["more_state"],
+        "less": spec["less_state"],
+    }
+
+    sequence_match: dict[str, Any] | None = None
+
+    for more_phase in relevant:
+        if more_phase.get("state") != spec["more_state"]:
+            continue
+
+        for less_phase in relevant:
+            if less_phase["phase_index"] <= more_phase["phase_index"]:
+                continue
+            if less_phase.get("state") != spec["less_state"]:
+                continue
+
+            center_between = any(
+                phase.get("kind") == "center"
+                for phase in phases[more_phase["phase_index"] + 1 : less_phase["phase_index"]]
+            )
+
+            sequence_match = {
+                "more_phase": more_phase,
+                "less_phase": less_phase,
+                "center_between": center_between,
+            }
+            break
+
+        if sequence_match is not None:
+            break
+
+    more_count = sum(1 for phase in relevant if phase.get("state") == spec["more_state"])
+    less_count = sum(1 for phase in relevant if phase.get("state") == spec["less_state"])
+
+    if expected_blocks and sequence_match and sequence_match.get("center_between"):
+        status = "confirmed"
+        summary = (
+            f"Confirmed {spec['display_name']} validation: observed selected-function "
+            f"code {expected_code}, then {spec['more_label']} "
+            f"({spec['more_state']}), center, then {spec['less_label']} "
+            f"({spec['less_state']})."
+        )
+    elif expected_blocks and sequence_match:
+        status = "candidate"
+        summary = (
+            f"Found {spec['display_name']} selected-function code {expected_code} and "
+            f"more -> less joystick polarity, but no clear center phase between them."
+        )
+    elif expected_blocks and (more_count or less_count):
+        status = "candidate"
+        summary = (
+            f"Found {spec['display_name']} selected-function code {expected_code}; "
+            f"observed {more_count} more-like and {less_count} less-like movement phase(s), "
+            "but not a complete more -> center -> less sequence."
+        )
+    elif expected_blocks:
+        status = "candidate"
+        summary = (
+            f"Found {spec['display_name']} selected-function code {expected_code}, "
+            "but no strong joystick movement phase tied to that function."
+        )
+    elif sequence_match:
+        status = "candidate"
+        summary = (
+            f"Observed joystick polarity consistent with {spec['display_name']}, "
+            "but did not observe a selected-function seating block for that function."
+        )
+    else:
+        status = "not_observed"
+        summary = (
+            f"Did not validate {spec['display_name']}: expected selected-function "
+            f"code {expected_code}, more={spec['more_state']}, less={spec['less_state']}."
+        )
+
+    return {
+        "recognizer": f"seating_{expected_function_name}_validation",
+        "implemented": True,
+        "status": status,
+        "summary": summary,
+        "line_count": len(lines),
+        "expected_function_code": expected_code,
+        "expected_function_name": expected_function_name,
+        "expected_function_display_name": spec["display_name"],
+        "expected_more_state": spec["more_state"],
+        "expected_less_state": spec["less_state"],
+        "expected_more_label": spec["more_label"],
+        "expected_less_label": spec["less_label"],
+        "deadzone": deadzone,
+        "min_peak": min_peak,
+        "joystick_can_id": f"0x{joystick_can_id:08X}",
+        "joystick_source": joystick_source,
+        "joystick_center": {
+            "x": center_x,
+            "y": center_y,
+            "source": center_source,
+        },
+        "seating_block_count": len(blocks),
+        "expected_function_block_count": len(expected_blocks),
+        "seating_blocks": summarize_seating_blocks(blocks),
+        "expected_function_blocks": summarize_seating_blocks(expected_blocks),
+        "movement_phase_count": len(annotated_movement_phases),
+        "relevant_movement_phase_count": len(relevant),
+        "more_like_phase_count": more_count,
+        "less_like_phase_count": less_count,
+        "sequence_match": sequence_match,
+        "movement_phases": annotated_movement_phases[:20],
+        "phases": phases[:30],
+        "safety_note": (
+            "Passive validation only. These observations are not commands and should not "
+            "be used as a transmit map for seating movement."
+        ),
+    }
+
+
+def recognize_seating_tilt_validation(
+    lines: list[str],
+    *,
+    known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    return recognize_seating_option_validation(
+        lines,
+        expected_function_name="tilt",
+        known_joystick_can_id=known_joystick_can_id,
+        known_joystick_center=known_joystick_center,
+    )
+
+
+def recognize_seating_elevate_validation(
+    lines: list[str],
+    *,
+    known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    return recognize_seating_option_validation(
+        lines,
+        expected_function_name="elevate",
+        known_joystick_can_id=known_joystick_can_id,
+        known_joystick_center=known_joystick_center,
+    )
+
+
+def recognize_seating_recline_validation(
+    lines: list[str],
+    *,
+    known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    return recognize_seating_option_validation(
+        lines,
+        expected_function_name="recline",
+        known_joystick_can_id=known_joystick_can_id,
+        known_joystick_center=known_joystick_center,
+    )
+
+
+def recognize_seating_legs_validation(
+    lines: list[str],
+    *,
+    known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
+) -> dict[str, Any]:
+    return recognize_seating_option_validation(
+        lines,
+        expected_function_name="legs",
+        known_joystick_can_id=known_joystick_can_id,
+        known_joystick_center=known_joystick_center,
+    )
+
 def recognize_step(
     step_key: str,
     lines: list[str],
@@ -2611,6 +3155,34 @@ def recognize_step(
 
     if step_key == "joystick_right":
         return recognize_joystick_right(
+            lines,
+            known_joystick_can_id=known_joystick_can_id,
+            known_joystick_center=known_joystick_center,
+        )
+
+    if step_key == "seating_tilt_validation":
+        return recognize_seating_tilt_validation(
+            lines,
+            known_joystick_can_id=known_joystick_can_id,
+            known_joystick_center=known_joystick_center,
+        )
+
+    if step_key == "seating_elevate_validation":
+        return recognize_seating_elevate_validation(
+            lines,
+            known_joystick_can_id=known_joystick_can_id,
+            known_joystick_center=known_joystick_center,
+        )
+
+    if step_key == "seating_recline_validation":
+        return recognize_seating_recline_validation(
+            lines,
+            known_joystick_can_id=known_joystick_can_id,
+            known_joystick_center=known_joystick_center,
+        )
+
+    if step_key == "seating_legs_validation":
+        return recognize_seating_legs_validation(
             lines,
             known_joystick_can_id=known_joystick_can_id,
             known_joystick_center=known_joystick_center,
@@ -3556,6 +4128,62 @@ def build_default_steps() -> list[WizardStep]:
             ),
             timeout_seconds=8.0,
             safety_note=drive_safety,
+        ),
+        WizardStep(
+            key="seating_tilt_validation",
+            title="12. Seating validation: tilt",
+            prompt=(
+                "Using the chair's normal controls, get into TILT seating mode. "
+                "When listening starts: tilt more for a bit, return the joystick to center, "
+                "tilt less for a bit, then return to center."
+            ),
+            timeout_seconds=16.0,
+            safety_note=(
+                "Passive validation only. Make sure the chair has clearance and nothing "
+                "can pinch, collide, or destabilize while seating moves."
+            ),
+        ),
+        WizardStep(
+            key="seating_elevate_validation",
+            title="13. Seating validation: elevate",
+            prompt=(
+                "Using the chair's normal controls, get into ELEVATE seating mode. "
+                "When listening starts: elevate more/raise for a bit, return the joystick "
+                "to center, elevate less/lower for a bit, then return to center."
+            ),
+            timeout_seconds=16.0,
+            safety_note=(
+                "Passive validation only. Make sure the chair has overhead/under-chair "
+                "clearance and is on level ground."
+            ),
+        ),
+        WizardStep(
+            key="seating_recline_validation",
+            title="14. Seating validation: recline / backrest",
+            prompt=(
+                "Using the chair's normal controls, get into RECLINE/BACKREST seating mode. "
+                "When listening starts: recline more for a bit, return the joystick to center, "
+                "recline less for a bit, then return to center."
+            ),
+            timeout_seconds=16.0,
+            safety_note=(
+                "Passive validation only. Make sure the chair has rear clearance and the "
+                "user is safely positioned."
+            ),
+        ),
+        WizardStep(
+            key="seating_legs_validation",
+            title="15. Seating validation: legs",
+            prompt=(
+                "Using the chair's normal controls, get into LEGS seating mode. "
+                "When listening starts: raise/extend legs for a bit, return the joystick "
+                "to center, lower/retract legs for a bit, then return to center."
+            ),
+            timeout_seconds=16.0,
+            safety_note=(
+                "Passive validation only. Make sure the footplates/legrests have clearance "
+                "and cannot hit people, walls, furniture, or the ground."
+            ),
         ),
     ]
 
