@@ -629,6 +629,46 @@ def get_confirmed_joystick_can_id(profile: MeetGreetProfile) -> int | None:
     )
 
 
+def get_confirmed_joystick_center(profile: MeetGreetProfile) -> tuple[int, int] | None:
+    """
+    Return the joystick center confirmed earlier in the wizard, if available.
+
+    Single-direction range tests should use this calibration center instead of
+    re-learning center from their own capture. In a range test, the most common
+    X/Y pair may be the held joystick value rather than true center.
+    """
+
+    def parse_center(value: Any) -> tuple[int, int] | None:
+        if not isinstance(value, dict):
+            return None
+
+        x = value.get("x")
+        y = value.get("y")
+
+        if isinstance(x, bool) or isinstance(y, bool):
+            return None
+
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return None
+
+        return int(round(x)), int(round(y))
+
+    parsed = parse_center(profile.confirmed.get("joystick_center"))
+    if parsed is not None:
+        return parsed
+
+    calibration_result = profile.steps.get("joystick_calibration")
+    if calibration_result is None:
+        return None
+
+    recognition = calibration_result.observations.get("recognition", {})
+    if recognition.get("status") != "confirmed":
+        return None
+
+    best_candidate = recognition.get("best_candidate") or {}
+    return parse_center(best_candidate.get("center"))
+
+
 def update_profile_from_step_result(
     profile: MeetGreetProfile,
     result: StepResult,
@@ -1936,6 +1976,7 @@ def recognize_joystick_single_direction(
     direction_name: str,
     deadzone: int = JOYSTICK_DEADZONE_DEFAULT,
     known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """
     Recognize one independently prompted joystick push.
@@ -1990,8 +2031,30 @@ def recognize_joystick_single_direction(
             continue
 
         pair_counts = Counter((sample["x"], sample["y"]) for sample in id_samples)
-        center_pair, center_count = pair_counts.most_common(1)[0]
-        center_x, center_y = center_pair
+
+        use_known_center = (
+            known_joystick_center is not None
+            and (known_joystick_can_id is None or can_id == known_joystick_can_id)
+        )
+
+        if use_known_center:
+            center_x, center_y = known_joystick_center
+            center_source = "joystick_calibration"
+            center_count = sum(
+                1
+                for sample in id_samples
+                if sample_is_centered(
+                    sample,
+                    center_x=center_x,
+                    center_y=center_y,
+                    deadzone=deadzone,
+                )
+            )
+        else:
+            center_pair, center_count = pair_counts.most_common(1)[0]
+            center_x, center_y = center_pair
+            center_source = "most_common_pair_in_this_step"
+
         center_fraction = center_count / len(id_samples)
 
         phases = compress_joystick_motion_phases(
@@ -2082,6 +2145,7 @@ def recognize_joystick_single_direction(
                     "y": center_y,
                     "sample_count": center_count,
                     "fraction": round(center_fraction, 3),
+                    "source": center_source,
                 },
                 "x_min": min(xs),
                 "x_max": max(xs),
@@ -2168,11 +2232,13 @@ def recognize_joystick_forward(
     lines: list[str],
     *,
     known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     return recognize_joystick_single_direction(
         lines,
         direction_name="forward",
         known_joystick_can_id=known_joystick_can_id,
+        known_joystick_center=known_joystick_center,
     )
 
 
@@ -2180,11 +2246,13 @@ def recognize_joystick_reverse(
     lines: list[str],
     *,
     known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     return recognize_joystick_single_direction(
         lines,
         direction_name="reverse",
         known_joystick_can_id=known_joystick_can_id,
+        known_joystick_center=known_joystick_center,
     )
 
 
@@ -2192,11 +2260,13 @@ def recognize_joystick_left(
     lines: list[str],
     *,
     known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     return recognize_joystick_single_direction(
         lines,
         direction_name="left",
         known_joystick_can_id=known_joystick_can_id,
+        known_joystick_center=known_joystick_center,
     )
 
 
@@ -2204,11 +2274,13 @@ def recognize_joystick_right(
     lines: list[str],
     *,
     known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     return recognize_joystick_single_direction(
         lines,
         direction_name="right",
         known_joystick_can_id=known_joystick_can_id,
+        known_joystick_center=known_joystick_center,
     )
 
 
@@ -2487,6 +2559,7 @@ def recognize_step(
     lines: list[str],
     *,
     known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """
     Dispatch step-specific recognition.
@@ -2519,24 +2592,28 @@ def recognize_step(
         return recognize_joystick_forward(
             lines,
             known_joystick_can_id=known_joystick_can_id,
+            known_joystick_center=known_joystick_center,
         )
 
     if step_key == "joystick_reverse":
         return recognize_joystick_reverse(
             lines,
             known_joystick_can_id=known_joystick_can_id,
+            known_joystick_center=known_joystick_center,
         )
 
     if step_key == "joystick_left":
         return recognize_joystick_left(
             lines,
             known_joystick_can_id=known_joystick_can_id,
+            known_joystick_center=known_joystick_center,
         )
 
     if step_key == "joystick_right":
         return recognize_joystick_right(
             lines,
             known_joystick_can_id=known_joystick_can_id,
+            known_joystick_center=known_joystick_center,
         )
 
     return {
@@ -3048,6 +3125,7 @@ def run_step(
     replay_root: Path | None = None,
     replay_pick: str = "ask",
     known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
     bus=None,
     interface: str = "can0",
 ) -> StepResult:
@@ -3058,6 +3136,7 @@ def run_step(
             replay_root=replay_root,
             replay_pick=replay_pick,
             known_joystick_can_id=known_joystick_can_id,
+            known_joystick_center=known_joystick_center,
         )
 
     return run_live_step(
@@ -3065,6 +3144,7 @@ def run_step(
         log_root,
         listen_seconds,
         known_joystick_can_id=known_joystick_can_id,
+        known_joystick_center=known_joystick_center,
         bus=bus,
         interface=interface,
     )
@@ -3076,6 +3156,7 @@ def run_live_step(
     listen_seconds: float | None,
     *,
     known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
     bus=None,
     interface: str = "can0",
 ) -> StepResult:
@@ -3125,6 +3206,7 @@ def run_live_step(
         step.key,
         lines,
         known_joystick_can_id=known_joystick_can_id,
+        known_joystick_center=known_joystick_center,
     )
     print_recognition_summary(recognition)
 
@@ -3150,6 +3232,7 @@ def run_live_step(
             log_root,
             listen_seconds,
             known_joystick_can_id=known_joystick_can_id,
+            known_joystick_center=known_joystick_center,
             bus=bus,
             interface=interface,
         )
@@ -3276,6 +3359,7 @@ def run_replay_step(
     replay_pick: str = "ask",
     *,
     known_joystick_can_id: int | None = None,
+    known_joystick_center: tuple[int, int] | None = None,
 ) -> StepResult:
     """Run one step using an existing saved log snippet, not live chair actions."""
     print("\n" + "=" * 78)
@@ -3318,6 +3402,7 @@ def run_replay_step(
         step.key,
         lines,
         known_joystick_can_id=known_joystick_can_id,
+        known_joystick_center=known_joystick_center,
     )
     print_recognition_summary(recognition)
 
@@ -4016,6 +4101,7 @@ def main() -> int:
     try:
         for step in steps:
             known_joystick_can_id = get_confirmed_joystick_can_id(profile)
+            known_joystick_center = get_confirmed_joystick_center(profile)
 
             result = run_step(
                 step,
@@ -4024,6 +4110,7 @@ def main() -> int:
                 replay_root=replay_root,
                 replay_pick=args.replay_pick,
                 known_joystick_can_id=known_joystick_can_id,
+                known_joystick_center=known_joystick_center,
                 bus=bus,
                 interface=args.interface,
             )
