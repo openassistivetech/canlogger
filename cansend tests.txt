@@ -1,0 +1,10 @@
+#long horn
+for i in {1..100}
+do
+    cansend can0 0C040100#
+done
+
+for i in {1..300}
+do
+    cansend can0 02000100#0064
+done
