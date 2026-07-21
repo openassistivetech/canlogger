@@ -111,11 +111,42 @@ PROGRAMMER_FLOOD_HEADLIGHT_TOGGLE_ID = 0x0C000F04
 # Passive profile discovery/control-family evidence.
 # These are used only for recognition of user-performed profile changes.
 # Observed/confirmed on Bumblebee and also consistent with rnet-lib docs:
-#   0x050 | node, payload 00 PP 00 00 requests profile index PP.
+#   0x050 | node, payload 00 PP 00 00 requests wire profile index PP.
+# R-Net profile configuration labels profiles as 1-8, while the wire index is
+# zero-based: profile number = profile index + 1.
 PROFILE_CONTROL_FAMILY_BASE = 0x050
 PROFILE_CONTROL_FAMILY_MAX = 0x05F
 PROFILE_INDEX_MIN = 0
 PROFILE_INDEX_MAX = 7
+PROFILE_NUMBER_MIN = 1
+PROFILE_NUMBER_MAX = 8
+
+
+def profile_index_to_number(profile_index: int | None) -> int | None:
+    """Convert wire profile index 0-7 to user/config profile number 1-8."""
+    if profile_index is None:
+        return None
+    if not (PROFILE_INDEX_MIN <= profile_index <= PROFILE_INDEX_MAX):
+        return None
+    return profile_index + 1
+
+
+def profile_number_to_index(profile_number: int | None) -> int | None:
+    """Convert user/config profile number 1-8 to wire profile index 0-7."""
+    if profile_number is None:
+        return None
+    if not (PROFILE_NUMBER_MIN <= profile_number <= PROFILE_NUMBER_MAX):
+        return None
+    return profile_number - 1
+
+
+def profile_indices_to_numbers(profile_indices: list[int]) -> list[int]:
+    """Convert a list of valid wire profile indices to config profile numbers."""
+    return [
+        profile_number
+        for profile_number in (profile_index_to_number(profile_index) for profile_index in profile_indices)
+        if profile_number is not None
+    ]
 
 
 # Passive seating/display status evidence observed on this chair/profile.
@@ -744,8 +775,14 @@ def update_profile_from_step_result(
             profile.confirmed["profile_control_family"] = "0x050|node"
             profile.confirmed["profile_request_pattern"] = "00 PP 00 00"
             profile.confirmed["observed_profile_indices"] = recognition.get("observed_profile_indices", [])
+            profile.confirmed["observed_profile_numbers"] = recognition.get("observed_profile_numbers", [])
             profile.confirmed["active_profile_sequence"] = recognition.get("active_profile_sequence", [])
+            profile.confirmed["active_profile_number_sequence"] = recognition.get("active_profile_number_sequence", [])
             profile.confirmed["enabled_profile_candidates"] = recognition.get("enabled_profile_candidates", [])
+            profile.confirmed["profile_numbering_note"] = (
+                "R-Net profile configuration uses profile numbers 1-8; "
+                "wire frames use zero-based profile indices 0-7."
+            )
         return
 
     if result.key != "joystick_calibration":
@@ -2828,7 +2865,8 @@ def classify_profile_control_frame(frame: dict[str, Any]) -> dict[str, Any] | No
     Passive interpretation only. The request shape observed on Bumblebee and
     described by rnet-lib is:
       0x050 | node, payload 00 PP 00 00
-    where PP is the requested profile index.
+    where PP is the requested zero-based wire profile index. In user-facing
+    profile configuration, that same profile is numbered PP + 1.
 
     PM-owned 0x050 response/status trains commonly echo PP in byte 1:
       050#11PP0002
@@ -2850,6 +2888,7 @@ def classify_profile_control_frame(frame: dict[str, Any]) -> dict[str, Any] | No
             "data_hex": frame["data_hex"],
             "role": "profile_family_short_or_empty",
             "profile_index": None,
+            "profile_number": None,
             "raw": frame["raw"],
         }
 
@@ -2857,6 +2896,7 @@ def classify_profile_control_frame(frame: dict[str, Any]) -> dict[str, Any] | No
     first = data[0]
     profile_index = data[1]
     profile_index_valid = PROFILE_INDEX_MIN <= profile_index <= PROFILE_INDEX_MAX
+    profile_number = profile_index_to_number(profile_index) if profile_index_valid else None
 
     role = "profile_family_other"
     confidence = "low"
@@ -2881,6 +2921,7 @@ def classify_profile_control_frame(frame: dict[str, Any]) -> dict[str, Any] | No
         "role": role,
         "confidence": confidence,
         "profile_index": profile_index if profile_index_valid else None,
+        "profile_number": profile_number,
         "first_byte": f"0x{first:02X}",
         "raw": frame["raw"],
     }
@@ -2937,12 +2978,15 @@ def group_profile_events(
 
         requested_indices = sorted({item["profile_index"] for item in requested})
         response_indices = sorted({item["profile_index"] for item in responses})
+        requested_numbers = profile_indices_to_numbers(requested_indices)
+        response_numbers = profile_indices_to_numbers(response_indices)
 
         active_profile = None
         if response_indices:
             active_profile = profile_counts.most_common(1)[0][0]
         elif requested_indices:
             active_profile = requested_indices[-1]
+        active_profile_number = profile_index_to_number(active_profile)
 
         events.append(
             {
@@ -2952,10 +2996,18 @@ def group_profile_events(
                 "duration_seconds": round(group[-1]["timestamp"] - group[0]["timestamp"], 6),
                 "frame_count": len(group),
                 "requested_profile_indices": requested_indices,
+                "requested_profile_numbers": requested_numbers,
                 "response_profile_indices": response_indices,
+                "response_profile_numbers": response_numbers,
                 "inferred_active_profile_index": active_profile,
+                "inferred_active_profile_number": active_profile_number,
                 "profile_index_counts": {
                     str(profile): count for profile, count in sorted(profile_counts.items())
+                },
+                "profile_number_counts": {
+                    str(profile_index_to_number(profile)): count
+                    for profile, count in sorted(profile_counts.items())
+                    if profile_index_to_number(profile) is not None
                 },
                 "request_count": len(requested),
                 "response_count": len(responses),
@@ -3005,18 +3057,23 @@ def recognize_profile_discovery(lines: list[str]) -> dict[str, Any]:
         if item.get("profile_index") is not None
     })
     observed_indices = sorted(set(request_indices) | set(response_indices))
+    request_numbers = profile_indices_to_numbers(request_indices)
+    response_numbers = profile_indices_to_numbers(response_indices)
+    observed_numbers = profile_indices_to_numbers(observed_indices)
 
     events = group_profile_events(classified)
     active_sequence = [
         event.get("inferred_active_profile_index") for event in events
         if event.get("inferred_active_profile_index") is not None
     ]
+    active_number_sequence = profile_indices_to_numbers(active_sequence)
 
     if len(observed_indices) >= 2 and responses:
         status = "confirmed"
         summary = (
             "Confirmed profile-control family activity while cycling profiles: "
-            f"observed profile indices {observed_indices}, with PM-owned 0x050 "
+            f"observed profile numbers {observed_numbers} "
+            f"(wire indices {observed_indices}), with PM-owned 0x050 "
             "response/status evidence."
         )
     elif observed_indices and (requests or responses):
@@ -3035,6 +3092,7 @@ def recognize_profile_discovery(lines: list[str]) -> dict[str, Any]:
     enabled_profile_candidates = [
         {
             "profile_index": profile_index,
+            "profile_number": profile_index_to_number(profile_index),
             "request_count": sum(1 for item in requests if item.get("profile_index") == profile_index),
             "response_count": sum(1 for item in responses if item.get("profile_index") == profile_index),
             "event_count": sum(
@@ -3053,10 +3111,18 @@ def recognize_profile_discovery(lines: list[str]) -> dict[str, Any]:
         "line_count": len(lines),
         "profile_family_base": "0x050",
         "profile_request_pattern": "0x050|node payload 00 PP 00 00",
+        "profile_numbering_note": (
+            "Profile configuration uses profile numbers 1-8; wire frames use "
+            "zero-based profile indices 0-7, so number = index + 1."
+        ),
         "observed_profile_indices": observed_indices,
+        "observed_profile_numbers": observed_numbers,
         "request_profile_indices": request_indices,
+        "request_profile_numbers": request_numbers,
         "response_profile_indices": response_indices,
+        "response_profile_numbers": response_numbers,
         "active_profile_sequence": active_sequence,
+        "active_profile_number_sequence": active_number_sequence,
         "enabled_profile_candidates": enabled_profile_candidates,
         "profile_event_count": len(events),
         "profile_events": events[:20],
@@ -3069,8 +3135,9 @@ def recognize_profile_discovery(lines: list[str]) -> dict[str, Any]:
         "profile_startup_map_or_status_examples": startup_map[:12],
         "other_profile_family_examples": other_profile_family[:12],
         "safety_note": (
-            "Passive profile discovery only. Profile indices are chair/config specific; "
-            "do not assume profile names or safety limits transfer to another chair."
+            "Passive profile discovery only. Profile numbers and indices are "
+            "chair/config specific; do not assume profile names or safety limits "
+            "transfer to another chair."
         ),
     }
 
@@ -4357,6 +4424,8 @@ def build_default_steps() -> list[WizardStep]:
                 "When listening starts, repeatedly press the chair's normal profile/mode "
                 "button to cycle through every enabled drive profile, then continue until "
                 "the starting profile appears again. Pause about one second on each profile. "
+                "In comments, record the user-facing profile numbers/names if known; "
+                "the recognizer will map wire indices 0-7 to profile numbers 1-8. "
                 "If the button enters seating or another non-drive mode, note that in the "
                 "comments and return to drive mode using the normal controls."
             ),
@@ -4606,13 +4675,18 @@ def collect_confirmed_ids(profile_dict: dict[str, Any]) -> list[list[Any]]:
             f"center X={center.get('x', '')}, Y={center.get('y', '')}",
         ])
 
-    observed_profiles = confirmed.get("observed_profile_indices") or []
-    if observed_profiles:
+    observed_profile_numbers = confirmed.get("observed_profile_numbers") or []
+    observed_profile_indices = confirmed.get("observed_profile_indices") or []
+    if observed_profile_numbers or observed_profile_indices:
         rows.append([
             "Drive profile control",
             confirmed.get("profile_control_family", "0x050|node"),
             "confirmed",
-            f"observed profile indices={observed_profiles}; pattern={confirmed.get('profile_request_pattern', '00 PP 00 00')}",
+            (
+                f"observed profile numbers={observed_profile_numbers}; "
+                f"wire indices={observed_profile_indices}; "
+                f"pattern={confirmed.get('profile_request_pattern', '00 PP 00 00')}"
+            ),
         ])
 
     horn = step_recognition(profile_dict, "horn")
