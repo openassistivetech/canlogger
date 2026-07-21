@@ -108,7 +108,19 @@ PROGRAMMER_LEFT_INDICATOR_TOGGLE_ID = 0x0C000F01
 PROGRAMMER_RIGHT_INDICATOR_TOGGLE_ID = 0x0C000F02
 PROGRAMMER_FLOOD_HEADLIGHT_TOGGLE_ID = 0x0C000F04
 
-# Seating frames
+# Passive profile discovery/control-family evidence.
+# These are used only for recognition of user-performed profile changes.
+# Observed/confirmed on Bumblebee and also consistent with rnet-lib docs:
+#   0x050 | node, payload 00 PP 00 00 requests profile index PP.
+PROFILE_CONTROL_FAMILY_BASE = 0x050
+PROFILE_CONTROL_FAMILY_MAX = 0x05F
+PROFILE_INDEX_MIN = 0
+PROFILE_INDEX_MAX = 7
+
+
+# Passive seating/display status evidence observed on this chair/profile.
+# These are NOT transmit commands. They are used only to recognize user-performed
+# seating function selection and joystick movement context.
 SEATING_BLOCK_ID = 0x0C180300
 SEATING_BLOCK_START_DATA = "0202"
 SEATING_BLOCK_END_DATA = "0201"
@@ -726,6 +738,15 @@ def update_profile_from_step_result(
     found the joystick command ID.
     """
     recognition = result.observations.get("recognition", {})
+
+    if result.key == "profile_discovery":
+        if recognition.get("status") in {"confirmed", "candidate"}:
+            profile.confirmed["profile_control_family"] = "0x050|node"
+            profile.confirmed["profile_request_pattern"] = "00 PP 00 00"
+            profile.confirmed["observed_profile_indices"] = recognition.get("observed_profile_indices", [])
+            profile.confirmed["active_profile_sequence"] = recognition.get("active_profile_sequence", [])
+            profile.confirmed["enabled_profile_candidates"] = recognition.get("enabled_profile_candidates", [])
+        return
 
     if result.key != "joystick_calibration":
         return
@@ -2794,6 +2815,265 @@ def seating_motion_label_for_state(
     return None
 
 
+
+def is_profile_control_family(can_id: int) -> bool:
+    """Return True for the 0x050 | node profile-control family."""
+    return PROFILE_CONTROL_FAMILY_BASE <= can_id <= PROFILE_CONTROL_FAMILY_MAX
+
+
+def classify_profile_control_frame(frame: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Classify a frame from the R-Net profile-control family.
+
+    Passive interpretation only. The request shape observed on Bumblebee and
+    described by rnet-lib is:
+      0x050 | node, payload 00 PP 00 00
+    where PP is the requested profile index.
+
+    PM-owned 0x050 response/status trains commonly echo PP in byte 1:
+      050#11PP0002
+      050#20PP0000
+      050#30PP0001
+      050#91PP0000
+      050#81PP0001
+    """
+    can_id = frame["can_id"]
+    if not is_profile_control_family(can_id):
+        return None
+
+    data = data_hex_to_bytes(frame["data_hex"])
+    if len(data) < 4:
+        return {
+            "timestamp": frame["timestamp"],
+            "can_id": frame["can_id_hex"],
+            "node": can_id & 0xF,
+            "data_hex": frame["data_hex"],
+            "role": "profile_family_short_or_empty",
+            "profile_index": None,
+            "raw": frame["raw"],
+        }
+
+    node = can_id & 0xF
+    first = data[0]
+    profile_index = data[1]
+    profile_index_valid = PROFILE_INDEX_MIN <= profile_index <= PROFILE_INDEX_MAX
+
+    role = "profile_family_other"
+    confidence = "low"
+
+    if node != 0 and first == 0x00 and data[2] == 0x00 and data[3] == 0x00:
+        role = "profile_request"
+        confidence = "high" if profile_index_valid else "low"
+    elif node == 0 and profile_index_valid and (first & 0xF0) in {0x10, 0x20, 0x30, 0x80, 0x90}:
+        role = "profile_response_or_status"
+        confidence = "medium_high"
+    elif node == 0 and first in {0xC0, 0xD0, 0xF0}:
+        # Often seen during startup/profile-map-like bursts. Keep separate so it
+        # does not overstate active profile changes.
+        role = "profile_startup_map_or_status"
+        confidence = "low_medium"
+
+    return {
+        "timestamp": frame["timestamp"],
+        "can_id": frame["can_id_hex"],
+        "node": node,
+        "data_hex": frame["data_hex"],
+        "role": role,
+        "confidence": confidence,
+        "profile_index": profile_index if profile_index_valid else None,
+        "first_byte": f"0x{first:02X}",
+        "raw": frame["raw"],
+    }
+
+
+def group_profile_events(
+    classified_frames: list[dict[str, Any]],
+    *,
+    max_gap_seconds: float = 0.25,
+) -> list[dict[str, Any]]:
+    """
+    Group nearby profile request/response frames into transition events.
+    """
+    interesting = [
+        item for item in classified_frames
+        if item.get("role") in {"profile_request", "profile_response_or_status"}
+    ]
+    if not interesting:
+        return []
+
+    interesting.sort(key=lambda item: item["timestamp"])
+    groups: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+
+    for item in interesting:
+        if not current:
+            current = [item]
+            continue
+        if item["timestamp"] - current[-1]["timestamp"] <= max_gap_seconds:
+            current.append(item)
+            continue
+        groups.append(current)
+        current = [item]
+
+    if current:
+        groups.append(current)
+
+    events: list[dict[str, Any]] = []
+    for index, group in enumerate(groups, start=1):
+        profile_counts = Counter(
+            item["profile_index"] for item in group
+            if item.get("profile_index") is not None
+        )
+        requested = [
+            item for item in group
+            if item.get("role") == "profile_request"
+            and item.get("profile_index") is not None
+        ]
+        responses = [
+            item for item in group
+            if item.get("role") == "profile_response_or_status"
+            and item.get("profile_index") is not None
+        ]
+
+        requested_indices = sorted({item["profile_index"] for item in requested})
+        response_indices = sorted({item["profile_index"] for item in responses})
+
+        active_profile = None
+        if response_indices:
+            active_profile = profile_counts.most_common(1)[0][0]
+        elif requested_indices:
+            active_profile = requested_indices[-1]
+
+        events.append(
+            {
+                "event_index": index,
+                "start_timestamp": group[0]["timestamp"],
+                "end_timestamp": group[-1]["timestamp"],
+                "duration_seconds": round(group[-1]["timestamp"] - group[0]["timestamp"], 6),
+                "frame_count": len(group),
+                "requested_profile_indices": requested_indices,
+                "response_profile_indices": response_indices,
+                "inferred_active_profile_index": active_profile,
+                "profile_index_counts": {
+                    str(profile): count for profile, count in sorted(profile_counts.items())
+                },
+                "request_count": len(requested),
+                "response_count": len(responses),
+                "example_lines": [item["raw"] for item in group[:8]],
+            }
+        )
+
+    return events
+
+
+def recognize_profile_discovery(lines: list[str]) -> dict[str, Any]:
+    """
+    Recognize enabled/active profile indices from a user-performed profile cycle.
+
+    User step: start in a known profile, then repeatedly press the chair's
+    normal profile/mode button until the starting profile repeats. This
+    recognizer reports observed request/response indices without assuming
+    chair-specific display names.
+    """
+    frames = [parse_can_log_line(line) for line in lines]
+    parsed_frames = [frame for frame in frames if frame is not None]
+
+    classified = []
+    for frame in parsed_frames:
+        item = classify_profile_control_frame(frame)
+        if item is not None:
+            classified.append(item)
+
+    requests = [item for item in classified if item.get("role") == "profile_request"]
+    responses = [item for item in classified if item.get("role") == "profile_response_or_status"]
+    startup_map = [item for item in classified if item.get("role") == "profile_startup_map_or_status"]
+    other_profile_family = [
+        item for item in classified
+        if item.get("role") not in {
+            "profile_request",
+            "profile_response_or_status",
+            "profile_startup_map_or_status",
+        }
+    ]
+
+    request_indices = sorted({
+        item["profile_index"] for item in requests
+        if item.get("profile_index") is not None
+    })
+    response_indices = sorted({
+        item["profile_index"] for item in responses
+        if item.get("profile_index") is not None
+    })
+    observed_indices = sorted(set(request_indices) | set(response_indices))
+
+    events = group_profile_events(classified)
+    active_sequence = [
+        event.get("inferred_active_profile_index") for event in events
+        if event.get("inferred_active_profile_index") is not None
+    ]
+
+    if len(observed_indices) >= 2 and responses:
+        status = "confirmed"
+        summary = (
+            "Confirmed profile-control family activity while cycling profiles: "
+            f"observed profile indices {observed_indices}, with PM-owned 0x050 "
+            "response/status evidence."
+        )
+    elif observed_indices and (requests or responses):
+        status = "candidate"
+        summary = (
+            "Observed profile-control family activity, but only one profile index or "
+            "limited response evidence was present."
+        )
+    else:
+        status = "not_observed"
+        summary = (
+            "No clear 0x050|node profile request/response activity observed. "
+            "Ask the user to cycle profiles with the chair's normal controls."
+        )
+
+    enabled_profile_candidates = [
+        {
+            "profile_index": profile_index,
+            "request_count": sum(1 for item in requests if item.get("profile_index") == profile_index),
+            "response_count": sum(1 for item in responses if item.get("profile_index") == profile_index),
+            "event_count": sum(
+                1 for event in events
+                if event.get("inferred_active_profile_index") == profile_index
+            ),
+        }
+        for profile_index in observed_indices
+    ]
+
+    return {
+        "recognizer": "profile_discovery",
+        "implemented": True,
+        "status": status,
+        "summary": summary,
+        "line_count": len(lines),
+        "profile_family_base": "0x050",
+        "profile_request_pattern": "0x050|node payload 00 PP 00 00",
+        "observed_profile_indices": observed_indices,
+        "request_profile_indices": request_indices,
+        "response_profile_indices": response_indices,
+        "active_profile_sequence": active_sequence,
+        "enabled_profile_candidates": enabled_profile_candidates,
+        "profile_event_count": len(events),
+        "profile_events": events[:20],
+        "profile_request_count": len(requests),
+        "profile_response_count": len(responses),
+        "profile_startup_map_or_status_count": len(startup_map),
+        "other_profile_family_count": len(other_profile_family),
+        "profile_requests": requests[:20],
+        "profile_responses": responses[:30],
+        "profile_startup_map_or_status_examples": startup_map[:12],
+        "other_profile_family_examples": other_profile_family[:12],
+        "safety_note": (
+            "Passive profile discovery only. Profile indices are chair/config specific; "
+            "do not assume profile names or safety limits transfer to another chair."
+        ),
+    }
+
 def recognize_seating_option_validation(
     lines: list[str],
     *,
@@ -3159,6 +3439,9 @@ def recognize_step(
             known_joystick_can_id=known_joystick_can_id,
             known_joystick_center=known_joystick_center,
         )
+
+    if step_key == "profile_discovery":
+        return recognize_profile_discovery(lines)
 
     if step_key == "seating_tilt_validation":
         return recognize_seating_tilt_validation(
@@ -4067,8 +4350,25 @@ def build_default_steps() -> list[WizardStep]:
             timeout_seconds=8.0,
         ),
         WizardStep(
+            key="profile_discovery",
+            title="7. Drive profile discovery",
+            prompt=(
+                "Start in a known drive profile, preferably the lowest/indoor profile. "
+                "When listening starts, repeatedly press the chair's normal profile/mode "
+                "button to cycle through every enabled drive profile, then continue until "
+                "the starting profile appears again. Pause about one second on each profile. "
+                "If the button enters seating or another non-drive mode, note that in the "
+                "comments and return to drive mode using the normal controls."
+            ),
+            timeout_seconds=18.0,
+            safety_note=(
+                "Passive recognition only. Do not move the joystick during this step. "
+                "Profile names and limits are chair/config specific."
+            ),
+        ),
+        WizardStep(
             key="joystick_calibration",
-            title="7. Joystick ID / center / axes",
+            title="8. Joystick ID / center / axes",
             prompt=(
                 "When listening starts, move the joystick through this pattern slowly:\n"
                 "  1. center / hands off\n"
@@ -4087,7 +4387,7 @@ def build_default_steps() -> list[WizardStep]:
         ),
         WizardStep(
             key="joystick_forward",
-            title="8. Joystick forward range",
+            title="9. Joystick forward range",
             prompt=(
                 "Prepare a clear, safe path forward. "
                 "When listening starts, gently push the joystick forward, hold briefly, "
@@ -4098,7 +4398,7 @@ def build_default_steps() -> list[WizardStep]:
         ),
         WizardStep(
             key="joystick_reverse",
-            title="9. Joystick reverse range",
+            title="10. Joystick reverse range",
             prompt=(
                 "Prepare a clear, safe path behind the chair. "
                 "When listening starts, gently pull the joystick backward/reverse, hold briefly, "
@@ -4109,7 +4409,7 @@ def build_default_steps() -> list[WizardStep]:
         ),
         WizardStep(
             key="joystick_left",
-            title="10. Joystick left range",
+            title="11. Joystick left range",
             prompt=(
                 "Prepare a clear, safe area for a left turn or left joystick push. "
                 "When listening starts, gently push the joystick left, hold briefly, "
@@ -4120,7 +4420,7 @@ def build_default_steps() -> list[WizardStep]:
         ),
         WizardStep(
             key="joystick_right",
-            title="11. Joystick right range",
+            title="12. Joystick right range",
             prompt=(
                 "Prepare a clear, safe area for a right turn or right joystick push. "
                 "When listening starts, gently push the joystick right, hold briefly, "
@@ -4131,7 +4431,7 @@ def build_default_steps() -> list[WizardStep]:
         ),
         WizardStep(
             key="seating_tilt_validation",
-            title="12. Seating validation: tilt",
+            title="13. Seating validation: tilt",
             prompt=(
                 "Using the chair's normal controls, get into TILT seating mode. "
                 "When listening starts: tilt more for a bit, return the joystick to center, "
@@ -4145,7 +4445,7 @@ def build_default_steps() -> list[WizardStep]:
         ),
         WizardStep(
             key="seating_elevate_validation",
-            title="13. Seating validation: elevate",
+            title="14. Seating validation: elevate",
             prompt=(
                 "Using the chair's normal controls, get into ELEVATE seating mode. "
                 "When listening starts: elevate more/raise for a bit, return the joystick "
@@ -4159,7 +4459,7 @@ def build_default_steps() -> list[WizardStep]:
         ),
         WizardStep(
             key="seating_recline_validation",
-            title="14. Seating validation: recline / backrest",
+            title="15. Seating validation: recline / backrest",
             prompt=(
                 "Using the chair's normal controls, get into RECLINE/BACKREST seating mode. "
                 "When listening starts: recline more for a bit, return the joystick to center, "
@@ -4173,7 +4473,7 @@ def build_default_steps() -> list[WizardStep]:
         ),
         WizardStep(
             key="seating_legs_validation",
-            title="15. Seating validation: legs",
+            title="16. Seating validation: legs",
             prompt=(
                 "Using the chair's normal controls, get into LEGS seating mode. "
                 "When listening starts: raise/extend legs for a bit, return the joystick "
@@ -4304,6 +4604,15 @@ def collect_confirmed_ids(profile_dict: dict[str, Any]) -> list[list[Any]]:
             format_optional_can_id(joystick_id),
             "confirmed",
             f"center X={center.get('x', '')}, Y={center.get('y', '')}",
+        ])
+
+    observed_profiles = confirmed.get("observed_profile_indices") or []
+    if observed_profiles:
+        rows.append([
+            "Drive profile control",
+            confirmed.get("profile_control_family", "0x050|node"),
+            "confirmed",
+            f"observed profile indices={observed_profiles}; pattern={confirmed.get('profile_request_pattern', '00 PP 00 00')}",
         ])
 
     horn = step_recognition(profile_dict, "horn")
